@@ -1,8 +1,6 @@
 """
 L4. Оркестратор.
 
-Зона ответственности: Person 1 (Lead / Архитектор).
-
 Порядок одного цикла принятия решения ровно по разделу 1 ТЗ:
   1. получить состояние
   2. проверить полноту и актуальность данных
@@ -13,7 +11,7 @@ L4. Оркестратор.
   7. сравнить оставшиеся
   8. выбрать и объяснить, либо отказаться
 
-ПРАВИЛО РАЗРЕШЕНИЯ КОНФЛИКТА ЦЕЛЕЙ — лексикографическое, а не взвешенное:
+ПРАВИЛО РАЗРЕШЕНИЯ КОНФЛИКТА ЦЕЛЕЙ:
   1) жёсткие ограничения (бинарно, решает Gate)
   2) достаточен ли запас по жёстким спекам (бинарно, порог target_margin)
   3) величина воздействия (меньше = лучше)
@@ -71,10 +69,6 @@ class Orchestrator:
         gate: Optional[ConstraintGate] = None,
         telemetry: Optional["pd.DataFrame"] = None,
     ):
-        # telemetry нужна агенту надёжности: факторы со скользящим окном
-        # (нестабильность давления и температуры, тепловое напряжение печи)
-        # по снимку ProcessState не считаются. Без неё агент работает на
-        # двух факторах из пяти и severity почти не меняется.
         self.quality = quality or QualityAgent()
         self.reliability = reliability or ReliabilityAgent(telemetry=telemetry)
         self.optimizer = optimizer or OptimizerAgent(self.quality)
@@ -83,14 +77,9 @@ class Orchestrator:
         self.rules = refusal_rules()
         self.decision = load_config("constraints")["decision"]
         specs = quality_specs()
-        # Жёсткие — требования спецификации, по ним Gate отбраковывает и по
-        # ним же система сравнивает варианты. Мягкие — наши модельные
-        # допущения: их нарушение попадает в отчёт предупреждением, но
-        # выбор варианта не блокирует (см. gate._check_quality).
         self.hard_specs = {n: s for n, s in specs.items() if s.get("source") == "spec"}
         self.soft_specs = {n: s for n, s in specs.items() if n not in self.hard_specs}
 
-    # ------------------------------------------------------------------
     def run_cycle(self, state: ProcessState) -> DecisionTrace:
         q = self.quality.assess(state)
         r = self.reliability.assess(state)
@@ -98,14 +87,10 @@ class Orchestrator:
         candidates: List[Candidate] = []
         verdicts: List[GateVerdict] = []
 
-        # шаг 2: если данных не хватает — отказываемся ДО оптимизации
         rec = self._data_refusal(state, q)
 
         if rec is None:
             candidates = self._drop_micro_moves(self.optimizer.propose(state, q, r))
-            # Блендинг проверяется для КАЖДОГО кандидата: изменение отборов
-            # меняет доли компонентов дизельного пула, а проверка долей —
-            # обязательное жёсткое ограничение из раздела 4 ТЗ.
             verdicts = [
                 self.gate.check(c, state, r.allowed_ranges,
                                 blend_fractions=blend_fractions(state, c.deltas))
@@ -127,25 +112,16 @@ class Orchestrator:
 
         return DecisionTrace(state.ts, state, q, r, candidates, verdicts, rec)
 
-    # ------------------------------------------------------------------
-    # Шаг 2. Полнота и актуальность данных
-    # ------------------------------------------------------------------
     def _data_refusal(
         self, state: ProcessState, q: QualityAssess
     ) -> Optional[Recommendation]:
         """
-        Умение корректно отказаться — часть качественного решения (ТЗ).
-
         Отказ по данным наступает, когда по жёсткой спеке НЕ ОСТАЛОСЬ НИ
         ОДНОГО пригодного измерения. ТЗ задаёт приоритет источников
         ЛИМС -> ПАК -> ВАК, то есть поточный анализатор — законный
         источник, а не отсутствие данных: при живом свежем ПАК и
         устаревшем ЛИМС система обязана работать, просто с меньшим
         доверием (его считает QualityAgent).
-
-        Более строгое поведение включается ключом require_healthy_pak
-        в config/constraints.yaml: тогда неисправный ПАК сам по себе
-        достаточен для отказа, даже при свежем лабораторном анализе.
         """
         reasons: List[str] = []
         max_age = self.rules["max_lims_age_min"]
@@ -154,9 +130,6 @@ class Orchestrator:
             lims = state.lims.get(name)
             pak = state.pak.get(name)
 
-            # Строгий режим: неисправный ПАК — сам по себе повод отказаться,
-            # даже когда лабораторный анализ свежий. Проверяется ДО поиска
-            # пригодного источника, иначе живой ЛИМС прятал бы мёртвый ПАК.
             if self.rules["require_healthy_pak"] and pak is not None and not pak.healthy:
                 reasons.append(
                     f"поточный анализатор {name} признан неисправным (залипание)"
@@ -186,7 +159,6 @@ class Orchestrator:
 
     @staticmethod
     def _source_status(name: str, m, max_age_min: float) -> str:
-        """Почему именно источник непригоден — оператору нужна причина, не флаг."""
         if m is None or m.value is None:
             return f"{name} отсутствует"
         if not m.healthy:
@@ -198,18 +170,10 @@ class Orchestrator:
                     f"при пороге {max_age_min / 60:.0f} ч")
         return f"{name} пригоден"
 
-    # ------------------------------------------------------------------
-    # Шаги 5-6. Кандидаты и отбраковка
-    # ------------------------------------------------------------------
     def _drop_micro_moves(self, candidates: List[Candidate]) -> List[Candidate]:
         """
         action_deadband: движение меньше порога неотличимо от шума регулятора,
         и предлагать его оператору — значит тратить его доверие впустую.
-
-        На текущей сетке оптимизатора не отбрасывается ничего: её шаг
-        (max_step / grid_points) заведомо крупнее порога. Правило нужно для
-        шага 2 роадмапа оптимизатора, где сетку заменит scipy и дельты
-        станут непрерывными.
         """
         dead = float(self.decision["action_deadband"])
         mvars = manipulated_vars()
@@ -254,10 +218,6 @@ class Orchestrator:
             margin = self._hard_margin(v)
             if margin is None or margin <= base_margin:
                 continue
-            # Жёсткие ограничения, кроме самой нарушенной спеки, обязаны
-            # выполняться: диапазоны, шаг, доли блендинга. Мягкие допущения
-            # проходят предупреждением — иначе наша же придуманная граница
-            # заблокировала бы возврат продукта в спецификацию.
             if any(
                 m < 0 for k, m in v.margins.items()
                 if k not in self.hard_specs and k not in self.soft_specs
@@ -266,16 +226,9 @@ class Orchestrator:
             out.append(c)
         return out
 
-    # ------------------------------------------------------------------
-    # Шаг 7. Сравнение вариантов
-    # ------------------------------------------------------------------
     def _hard_margin(self, v: GateVerdict) -> Optional[float]:
         """
         Худший запас по жёстким спекам, одно число для сравнения вариантов.
-
-        None означает, что Gate не смог проверить хотя бы одну спеку
-        (нет прогноза). Такой вариант не сравнивается с остальными и не
-        может быть выбран: отсутствие проверки — это не нулевой запас.
         """
         margins = [v.margins.get(name) for name in self.hard_specs]
         if not margins or any(m is None for m in margins):
@@ -324,21 +277,13 @@ class Orchestrator:
             v = vmap[c.candidate_id]
             margin = self._hard_margin(v)
             if margin is None:
-                return (2, 0.0, 0.0, 0.0, 0.0)     # проверка не выполнена — в конец
+                return (2, 0.0, 0.0, 0.0, 0.0)
             if self._is_sufficient(v):
                 return (0, 0.0, effort(c), c.severity_delta, c.cost_proxy)
-            # Запаса не хватает: сначала запас, но при РАВНОМ запасе —
-            # меньшее воздействие. Без этого правила система выбирала
-            # вариант, который резал выпуск на 4 т/ч, не добавляя ни
-            # сотой запаса: по запасу ничья, а дальше решал порядок
-            # перебора.
             return (1, -round(margin, 3), effort(c), c.severity_delta, c.cost_proxy)
 
         return sorted(survivors, key=key)
 
-    # ------------------------------------------------------------------
-    # Шаг 8. Рекомендация и объяснение
-    # ------------------------------------------------------------------
     def _baseline(self, candidates, verdicts):
         """Вариант «ничего не менять» вместе с его вердиктом, если он есть."""
         vmap = {v.candidate_id: v for v in verdicts}
@@ -364,7 +309,6 @@ class Orchestrator:
             return head
         return f"{head}; при бездействии нарушается: {'; '.join(v.violated)}"
 
-    # ------------------------------------------------------------------
     def _refuse(
         self,
         state: ProcessState,
@@ -373,10 +317,6 @@ class Orchestrator:
         verdicts: List[GateVerdict],
         baseline=None,
     ) -> Recommendation:
-        # Отказ не означает "ничего не известно": если вариант бездействия
-        # проверялся, оператор видит его прогноз и какие проверки он
-        # проходит. Пустые блоки вместо этих чисел выглядели бы так,
-        # будто система вообще ничего не считала.
         effect: Dict[str, Any] = {}
         checked: List[str] = []
         violated: List[str] = []
@@ -467,7 +407,6 @@ class Orchestrator:
         rec.explanation = render_explanation(rec, q, r, best, v, len(survivors))
         return rec
 
-    # ------------------------------------------------------------------
     def _reason(
         self,
         q: QualityAssess,
@@ -492,11 +431,6 @@ class Orchestrator:
             )
         if best.is_no_action:
             return "режим устойчив, запас по всем жёстким ограничениям сохраняется"
-
-        # Действие выдано, значит запас хотя бы по одной спеке ниже целевого.
-        # Называть причиной spec_risk_prob нельзя: он считается для ТЕКУЩЕГО
-        # состояния и в этот момент обычно уже нулевой — получалось
-        # "риск 0%, но всё равно крутим".
         targets = self.decision["target_margin"]
         tight = [
             (name, v.margins[name], float(targets.get(name, 0.0)))
@@ -538,9 +472,6 @@ class Orchestrator:
     def _setpoints(state: ProcessState, best: Candidate) -> Dict[str, Any]:
         """
         Блок "текущее значение -> рекомендуемое" из раздела 5 ТЗ.
-
-        Оператор работает с уставками, а не с приращениями: дельта
-        +2.50 без текущего значения не говорит ему, куда крутить.
         """
         mvars = manipulated_vars()
         out: Dict[str, Any] = {}
@@ -564,23 +495,6 @@ class Orchestrator:
         survivors: List[Candidate],
         verdicts: List[GateVerdict],
     ) -> List[Dict[str, Any]]:
-        """
-        Крайние точки компромисса, а не три соседние точки сетки.
-
-        Раньше сюда попадали варианты, отличающиеся от выбранного на
-        полградуса: формально альтернативы, по смыслу тот же самый вариант.
-        ТЗ требует показать, ЧЕМ выбранный вариант лучше допустимых
-        альтернатив, поэтому берутся крайние по каждому критерию сравнения:
-        максимум выпуска, минимум затрат, мягчайший режим, наибольший запас.
-        Каждая подписана, и оператор видит цену выбора.
-
-        Почему не OptimizerAgent.pareto_front(): его фронт строится по
-        (cost_proxy, severity_delta, sulfur_hi) и НЕ УЧИТЫВАЕТ выпуск,
-        а cost_proxy с severity_delta у нас оба зависят только от 242000:T5.
-        Фронт из-за этого вырождается: все точки с одинаковой температурой
-        неразличимы, и в альтернативы попадают варианты с одинаковыми
-        числами. Добавить yield_delta в ключ фронта — задача Person 4.
-        """
         vmap = {v.candidate_id: v for v in verdicts}
 
         def margin_of(c: Candidate) -> float:
@@ -597,8 +511,6 @@ class Orchestrator:
         out: List[Dict[str, Any]] = []
         seen = {best.candidate_id}
         for label, key in criteria:
-            # при равенстве — вариант с меньшим воздействием, чтобы
-            # альтернатива не оказалась крайностью на пустом месте
             pick = min(
                 survivors,
                 key=lambda c: (key(c), sum(abs(d) for d in c.deltas.values())),

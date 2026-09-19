@@ -1,19 +1,12 @@
 """
 L1a. Агент качества.
 
-Зона ответственности: Person 1 (Lead / Архитектор).
-
-ЭТО ОБОЛОЧКА, А НЕ МОДЕЛЬ. Сами предсказатели живут в src/models/
-и их пишет Person 3. Граница такая:
-
     src/models/   признаки на входе -> Interval на выходе.
                   Ничего не знает про ProcessState и спецификации.
 
     QualityAgent  вызывает обе модели, сцепляет их в цепочку АВТ -> ГО,
                   считает confidence по возрасту данных, считает
                   spec_risk_prob по конфигу, собирает QualityAssess.
-
-Такое разделение нужно, чтобы Person 1 и Person 3 не правили один файл.
 
 ЦЕПОЧКА: AVTModel предсказывает качество дизельной фракции, уходящей
 в гидроочистку. Её конец кипения (EBP) становится ВХОДОМ GOModel. Чем тяжелее хвост,
@@ -69,24 +62,12 @@ class QualityAgent:
             model_id=self.model_id,
         )
 
-    # ------------------------------------------------------------------
     def _predict(self, state: ProcessState, deltas: Dict[str, float]) -> Dict[str, Interval]:
         """
         Цепочка АВТ -> ГО. Обе модели вызываются ДВАЖДЫ — на текущем
         режиме и на предлагаемом — разницу берёт вызывающий код, не
         сама модель.
 
-        Stage 2: GOModel раньше работал через anchor+дельты (сера
-        считалась как измеренная плюс поправка). Это не позволяло
-        использовать лаги/волатильность температуры реактора, которые
-        оказались сильнейшим признаком для серы (std3h corr 0.45,
-        сырой T5 -- всего -0.09, см. models/go.py). Обучающих примеров
-        вида "что было бы при таком-то Δ" в истории нет, только
-        фактические траектории — поэтому GOModel, как и AVTModel,
-        теперь предсказывает АБСОЛЮТНОЕ значение по полному снимку
-        состояния, а разница считается здесь, вызовом дважды. Правка
-        сделана Person 3 в Stage 2 по согласованию (обычно этот файл —
-        Person 1), не пересекается с остальной логикой QualityAgent.
         """
         # 1. текущий режим АВТ
         f_now = {t: state.tag(t) for t in self.avt.required_features}
@@ -96,10 +77,7 @@ class QualityAgent:
         f_new = {t: (v + deltas.get(t, 0.0)) for t, v in f_now.items() if v is not None}
         avt_new = self.avt.predict(f_new)
 
-        # 3. гидроочистка: сырые теги 24-2000 (в т.ч. предпосчитанные
-        # лаг/волатильность-ключи вида '242000:T5__std3h' -- их обязан
-        # положить в state.tags билдер состояния, см. data/state_builder.py)
-        # + выход AVTModel + возраст катализатора.
+        # 3. гидроочистка: сырые теги 24-2000
         go_raw_now = {t: state.tag(t) for t in self.go.required_features
                       if t.startswith("242000:")}
         go_raw_now["catalyst_age_days"] = catalyst_age_days_scalar(state.ts)
@@ -120,40 +98,16 @@ class QualityAgent:
         go_new = self.go.predict(go_features(avt_new, go_raw_new))
         self._last_go_delta = {
             k: go_new[k].mean - go_now[k].mean for k in go_new
-        }  # для _drivers(), объяснимость эффекта действия
+        }
 
         go_new["sulfur_mgkg"] = self._sulfur_anchored(
             state, go_now["sulfur_mgkg"], go_new["sulfur_mgkg"]
         )
         return go_new
 
-    # ------------------------------------------------------------------
     def _sulfur_anchored(
         self, state: ProcessState, now_iv: Interval, new_iv: Interval
     ) -> Interval:
-        """
-        Уровень серы даёт ИЗМЕРЕНИЕ, модель отвечает только за эффект действия.
-
-        Абсолютный прогноз GOModel честен, но его conformal-интервал шириной
-        6.3 мг/кг при лимите 10 не проходит Gate никогда, включая вариант
-        "ничего не менять": жёсткая проверка идёт по hi. При этом сера
-        измеряется напрямую — ПАК каждые 10 минут, ЛИМС несколько раз в
-        сутки, — и измерение на порядок точнее модели. Поэтому уровень
-        берётся из измерения, а модель даёт разницу между текущим и
-        предлагаемым режимом. Это стандартная практика inferential control
-        (bias update по лабораторному результату), а не ослабление проверки.
-
-        Ширина интервала складывается из трёх слагаемых:
-          1. q90 роста серы за время с момента анализа плюс один цикл
-             управления — эмпирика по ПАК, config/constraints.yaml;
-          2. расхождение ЛИМС и ПАК, когда доступны оба. ТЗ называет
-             лабораторный результат контрольным фактом, поэтому разница
-             источников уходит в неопределённость, а не отбрасывается;
-          3. доля предсказанного эффекта, которая может не реализоваться.
-
-        Если пригодного измерения нет, возвращается абсолютный прогноз
-        модели как есть: широкий интервал тут — честный ответ, а не сбой.
-        """
         cfg = load_config("constraints")["sulfur_anchor"]
         max_age = refusal_rules()["max_lims_age_min"]
         usable = state.usable_sources("sulfur_mgkg", max_age)
@@ -173,16 +127,7 @@ class QualityAgent:
         mean = anchor.value + effect
         return Interval(mean, mean - half, mean + half)
 
-    # ------------------------------------------------------------------
     def _confidence(self, state: ProcessState) -> tuple:
-        """
-        Доверие к прогнозу падает от старых и мёртвых данных.
-        Это отдельная величина от spec_risk_prob.
-
-        Возвращает (доверие, причины снижения). Причины считает тот же код,
-        который считает число: иначе отчёт оператору вынужден угадывать,
-        что именно снизило доверие, и называет не тот фактор.
-        """
         rules = refusal_rules()
         conf = 0.9
         reasons = []
@@ -212,11 +157,9 @@ class QualityAgent:
 
         return max(0.0, round(conf, 3)), reasons
 
-    # ------------------------------------------------------------------
     def _spec_risk(self, preds: Dict[str, Interval]) -> float:
         """
         Грубая вероятность нарушить хотя бы одно требование.
-        TODO(Person 3): заменить на P(y > limit) из квантильной модели.
         """
         worst = 0.0
         for param, spec in quality_specs().items():
@@ -230,9 +173,7 @@ class QualityAgent:
             worst = max(worst, min(1.0, max(0.0, p)))
         return round(worst, 3)
 
-    # ------------------------------------------------------------------
     def _drivers(self, state: ProcessState, deltas: Dict[str, float]) -> list:
-        """TODO(Person 3): заменить на SHAP по обученной модели."""
         out = []
         # пороги = p75 и p25 по очищенной истории, см. config/constraints.yaml
         f30 = state.tag("AVT:F30")

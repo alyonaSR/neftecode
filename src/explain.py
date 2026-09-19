@@ -1,19 +1,9 @@
 """
 Сборка объяснения оператору.
 
-Зона ответственности: Person 1.
-
-ВАЖНО: текст собирается ИЗ ПОЛЕЙ структур, а не сочиняется.
-Нельзя показать на демо красивое объяснение, не подтверждённое числами.
-
-Если подключаете LLM — он получает на вход уже готовый Recommendation
-и только переписывает его человеческим языком. Права менять числа
-или добавлять новые утверждения у него нет.
-
 ЧТО ПОКАЗЫВАЕТ ОТЧЁТ. Блоки 1-7 — ровно таблица раздела 5 ТЗ. Блоки 8-10
 добавлены под критерии оценки: альтернативы с ценой выбора («чем выбранный
-вариант лучше»), явные допущения и обмен между агентами (мультиагентность
-должна быть видна, а не заявлена). Блоки 8-10 требуют DecisionTrace:
+вариант лучше»), явные допущения и обмен между агентами. Блоки 8-10 требуют DecisionTrace:
 в Recommendation этих данных нет и быть не должно, это ответ системы
 оператору, а не её внутренняя кухня.
 """
@@ -27,8 +17,6 @@ from .data.tags import load_config, manipulated_vars
 
 WIDTH = 78
 
-# Человеческие подписи скалярных полей expected_effect. Ключи приходят из
-# оркестратора; показатели качества подписываются сами через display.
 _EFFECT_LABELS = {
     "margin_to_spec": ("запас до спецификации", ""),
     "yield_delta_tph": ("изменение выпуска", "т/ч"),
@@ -41,9 +29,6 @@ def summarize_freshness(state: ProcessState) -> Dict[str, Any]:
     """
     Блок 'Время и состояние' из раздела 5 ТЗ.
 
-    Кроме свежести анализов кладём срез управляемых переменных: ТЗ просит
-    показать «ключевые актуальные параметры», а оператору нужно видеть,
-    от какого режима система отсчитывает рекомендацию.
     """
     out: Dict[str, Any] = {"ts": state.ts.isoformat(), "dq_flags": list(state.dq_flags)}
     for name, store in (("lims", state.lims), ("pak", state.pak)):
@@ -82,10 +67,6 @@ def _target_margin(name: str) -> Optional[float]:
     value = targets.get(name)
     return None if value is None else float(value)
 
-
-# ----------------------------------------------------------------------
-# Текстовое объяснение (идёт в Recommendation.explanation и в трейс)
-# ----------------------------------------------------------------------
 
 def render_explanation(rec, quality, reliability, candidate, verdict, n_survivors: int) -> str:
     parts: List[str] = []
@@ -146,10 +127,7 @@ def render_explanation(rec, quality, reliability, candidate, verdict, n_survivor
 
     return " ".join(parts)
 
-
-# ----------------------------------------------------------------------
 # Отчёт оператору
-# ----------------------------------------------------------------------
 
 def print_operator_report(
     rec: Recommendation, trace: Optional[DecisionTrace] = None
@@ -248,7 +226,6 @@ def _block_action(rec: Recommendation) -> List[str]:
     elif not rec.action:
         out.append("    изменений не требуется")
     elif setpoints:
-        # ТЗ, раздел 5: "тег/параметр, текущее значение -> рекомендуемое"
         out.append(f"    {'тег':<12} {'сейчас':>9} {'станет':>9} {'шаг':>8}  параметр")
         for tag, sp in setpoints.items():
             name = sp["name"] if abs(sp["delta"]) > 1e-9 else f"{sp['name']} (без изменений)"
@@ -270,8 +247,6 @@ def _block_effect(rec: Recommendation) -> List[str]:
         out.append("    не оценивается")
         return out
     if rec.is_refusal:
-        # При отказе управляющего воздействия нет, и эффекта от него тоже.
-        # Показываем, что будет, если оставить режим как есть.
         out.append("    прогноз при бездействии")
 
     for name, effect in _quality_items(rec.expected_effect):
@@ -318,8 +293,6 @@ def _block_checks(rec: Recommendation) -> List[str]:
     for check in rec.checks_failed:
         out.append(f"    [!] НАРУШЕНО: {check}")
     for check in rec.checks_warned:
-        # Мягкое: наше допущение, а не промышленный предел. Прятать нельзя,
-        # но и отбраковывать по нему рекомендацию мы не имеем права.
         out.append(f"    [~] ВНИМАНИЕ (модельное допущение): {check}")
     return out
 
@@ -329,9 +302,7 @@ def _block_confidence(
 ) -> List[str]:
     """
     Причины снижения доверия берутся у агента качества, а не выводятся
-    из свежести данных заново: пересчёт в двух местах уже приводил к тому,
-    что отчёт называл фактором устаревший анализ ПТФ, который на доверие
-    вообще не влияет.
+    из свежести данных заново
     """
     level = ("высокая" if rec.confidence >= 0.75
              else "средняя" if rec.confidence >= 0.5 else "низкая")
@@ -394,7 +365,6 @@ def _diff(label: str, alt_value, chosen_value) -> str:
 
 
 def _block_assumptions(trace: Optional[DecisionTrace]) -> List[str]:
-    """ТЗ требует, чтобы допущения были описаны явно, а не прятались в коде."""
     if trace is None or not trace.reliability.assumptions:
         return []
     out = ["\n[9] ДОПУЩЕНИЯ"]
@@ -404,12 +374,10 @@ def _block_assumptions(trace: Optional[DecisionTrace]) -> List[str]:
 
 
 def _fit(text: str, width: int) -> str:
-    """Обрезать до ширины колонки, не ломая выравнивание таблицы."""
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def _labeled(prefix: str, text: str) -> List[str]:
-    """Строка с подписью слева и переносом по ширине отчёта."""
     chunks = _wrap(text, WIDTH - len(prefix))
     if not chunks:
         return []
@@ -418,10 +386,6 @@ def _labeled(prefix: str, text: str) -> List[str]:
 
 
 def _block_agents(trace: Optional[DecisionTrace]) -> List[str]:
-    """
-    Мультиагентность должна быть видна в ответе системы, а не только
-    в архитектурной схеме: кто что оценил и как одно ограничило другое.
-    """
     if trace is None:
         return []
 
@@ -452,7 +416,6 @@ def _block_agents(trace: Optional[DecisionTrace]) -> List[str]:
 
 
 def _narrowed_ranges(allowed: Dict[str, List[float]]) -> int:
-    """Сколько диапазонов агент надёжности реально сузил против конфига."""
     mvars = manipulated_vars()
     count = 0
     for tag, (lo, hi) in allowed.items():
