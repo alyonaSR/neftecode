@@ -63,7 +63,8 @@ def build_sulfur_table(avt_model: AVTModel, tel_avt_raw, tel_go, lims, feed_dela
     Та же сборка, что train_go.py, но с опциональным сдвигом feed_ebp_c/
     feed_d15_kgm3 на feed_delay_h назад по времени (эксперимент 3).
     """
-    t5 = tel_go[["242000:T5", "242000:Q20"]].dropna()
+    t5 = tel_go[["242000:T5", "242000:T6", "242000:Q20"]].dropna()
+    t5["242000:T5_T6_quench_delta"] = t5["242000:T5"] - t5["242000:T6"]
     t5 = add_lags(t5, ["242000:T5", "242000:Q20"], lags_h=(3, 6))
     t5 = add_rolling(t5, ["242000:T5"], windows_h=(3, 6))
     t5 = t5.dropna()
