@@ -28,7 +28,7 @@ import pandas as pd
 
 from src.data.loaders import TARGET_POINT, load_lims, load_telemetry
 from src.models.avt import AVTModel
-from src.models.features import add_lags, add_rolling
+from src.models.features import add_lags, add_rolling, arrhenius_term
 from src.models.go import _SPECS, GOModel
 
 
@@ -74,6 +74,13 @@ def main():
     # H-A3: соотношение H2/сырьё (свежий ВСГ / расход сырья, нм3/т) --
     # влияет на парциальное давление H2, глубину HDS (research.pdf)
     t5["242000:h2_oil_ratio"] = t5["242000:F25"] / t5["242000:F9"].replace(0, float("nan"))
+    # H-A2: явный аррениусовский член exp(-Ea/RT) на сыром T5 (WABT из
+    # H-A1 отклонена -- физически необоснована для этой пары аппаратов),
+    # и его произведение с Q20 (кинетика первого порядка: скорость ~
+    # [S_сырья] x exp(-Ea/RT)) -- явное взаимодействие вместо надежды,
+    # что дерево само его найдёт.
+    t5["242000:arrhenius_t5"] = arrhenius_term(t5["242000:T5"])
+    t5["242000:q20_x_arrhenius"] = t5["242000:Q20"] * t5["242000:arrhenius_t5"]
     t5 = add_lags(t5, ["242000:T5", "242000:Q20"], lags_h=(3, 6))
     t5 = add_rolling(t5, ["242000:T5"], windows_h=(3, 6))
     t5 = t5.dropna()

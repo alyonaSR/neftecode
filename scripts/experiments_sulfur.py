@@ -21,6 +21,12 @@
   4. Ширина конформного интервала при alpha=0.05 (95%, как в
      research.pdf) против текущего alpha=0.10 -- для документации,
      без замены задеплоенной модели.
+  5. H-B3: честный трёхсторонний train/calib/TEST (SULFUR_HYPOTHESES.md).
+     За 2026-09-19 калибровочная выборка использовалась 6 раз подряд для
+     разных гипотез -- и для conformal-квантилей, и для отчёта RMSE.
+     Риск: незаметное переобучение на один и тот же отложенный кусок
+     через повторные итерации. Test здесь -- последние по времени 15%
+     данных, которых не видел НИ ОДИН прогон сегодня.
 """
 
 from __future__ import annotations
@@ -36,9 +42,10 @@ import pandas as pd
 from src.data.loaders import TARGET_POINT, load_lims, load_telemetry
 from src.models.avt import AVTModel
 from src.models.conformal import ConformalResidualBounds
-from src.models.features import add_lags, add_rolling
+from src.models.features import add_lags, add_rolling, arrhenius_term
 from src.models.go import GOModel, sulfur_arrhenius_baseline
 from src.models.go import _SPECS as GO_SPECS
+from src.models.formula_residual import FormulaPlusResidual
 
 ARTIFACTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "artifacts", "models")
@@ -66,6 +73,8 @@ def build_sulfur_table(avt_model: AVTModel, tel_avt_raw, tel_go, lims, feed_dela
     t5 = tel_go[["242000:T5", "242000:T6", "242000:Q20", "242000:F25", "242000:F9"]].dropna()
     t5["242000:T5_T6_quench_delta"] = t5["242000:T5"] - t5["242000:T6"]
     t5["242000:h2_oil_ratio"] = t5["242000:F25"] / t5["242000:F9"].replace(0, float("nan"))
+    t5["242000:arrhenius_t5"] = arrhenius_term(t5["242000:T5"])
+    t5["242000:q20_x_arrhenius"] = t5["242000:Q20"] * t5["242000:arrhenius_t5"]
     t5 = add_lags(t5, ["242000:T5", "242000:Q20"], lags_h=(3, 6))
     t5 = add_rolling(t5, ["242000:T5"], windows_h=(3, 6))
     t5 = t5.dropna()
@@ -191,6 +200,50 @@ def experiment_4_conformal_at_95pct(go: GOModel):
     print(f"  alpha=0.05 (research.pdf, 95%):     offset=[{offset_lo_95:.2f}, {offset_hi_95:.2f}], ширина={offset_hi_95-offset_lo_95:.2f}")
 
 
+def experiment_5_true_holdout_test(table: pd.DataFrame):
+    """
+    H-B3. table уже отсортирована по времени. Берём последние 15% как
+    TEST -- их не видел ни train, ни calib ни в одном прогоне сегодня
+    (production fit() всегда использовал последние 20% как calib, эта
+    зона теперь разбивается на calib(первые 5 п.п.)/test(последние 15 п.п.),
+    так что test -- совершенно новый кусок, не пересекающийся с тем, что
+    оценивался в экспериментах 1-4 и во всех сегодняшних retrain).
+
+    Обучает СВЕЖУЮ модель (не трогает artifacts/models/go_v1.joblib) на
+    первых 85% (внутри которых FormulaPlusResidual.fit() сам ещё раз
+    отрежет свои train/calib 80/20 -- как в продакшене), оценивает на
+    последних 15%.
+    """
+    print("\n=== Эксперимент 5 (H-B3): честный train/calib/TEST, test не видел никто ===")
+    n = len(table)
+    cut_traincalib = int(n * 0.85)
+    dev = table.iloc[:cut_traincalib]
+    test = table.iloc[cut_traincalib:]
+    print(f"  train+calib(внутр. 80/20)={len(dev)}  TEST(новый, не тронут)={len(test)}")
+
+    model = FormulaPlusResidual(
+        name="sulfur_mgkg_holdout_check",
+        formula_fn=sulfur_arrhenius_baseline,
+        formula_tags=["242000:T5"],
+        feature_cols=SULFUR_FEATURES,
+        fallback_mean=8.5,
+    )
+    model.fit(dev[SULFUR_FEATURES], dev["y"])
+
+    test_pred = [model.predict_one(r.to_dict()).mean for _, r in test[SULFUR_FEATURES].iterrows()]
+    test_rmse = float(np.sqrt(((np.array(test_pred) - test["y"]) ** 2).mean()))
+
+    dev_calib_cut = int(len(dev) * 0.8)
+    calib_part = dev.iloc[dev_calib_cut:]
+    calib_pred = [model.predict_one(r.to_dict()).mean for _, r in calib_part[SULFUR_FEATURES].iterrows()]
+    calib_rmse = float(np.sqrt(((np.array(calib_pred) - calib_part["y"]) ** 2).mean()))
+
+    print(f"  RMSE на CALIB (внутренний, использовался весь день) = {calib_rmse:.3f}")
+    print(f"  RMSE на TEST (новый, никто не видел)                = {test_rmse:.3f}")
+    gap = test_rmse - calib_rmse
+    print(f"  Разрыв test-calib = {gap:+.3f} ({'подозрительно' if gap > 0.5 else 'в пределах шума'})")
+
+
 def main():
     print("Загрузка данных и артефактов...")
     tel_avt_raw = load_telemetry("AVT")
@@ -213,6 +266,7 @@ def main():
     experiment_2_q20_ablation(X_train, y_train, X_calib, y_calib)
     experiment_3_lagged_feed_d15_vs_residual(avt, tel_avt_raw, tel_go, lims)
     experiment_4_conformal_at_95pct(go)
+    experiment_5_true_holdout_test(table)
 
 
 if __name__ == "__main__":

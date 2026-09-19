@@ -144,6 +144,7 @@ _SPECS = {
         "242000:T5__std3h", "242000:T5__std6h",
         "242000:Q20", "242000:Q20__lag3h", "242000:Q20__lag6h",
         "242000:T5_T6_quench_delta", "242000:h2_oil_ratio",
+        "242000:arrhenius_t5", "242000:q20_x_arrhenius",
         "feed_ebp_c", "feed_d15_kgm3",
     ], 8.5),
     "cfpp_c": (vak.godt_cfpp, vak.GODT["cfpp_c"][1], -5.0),
