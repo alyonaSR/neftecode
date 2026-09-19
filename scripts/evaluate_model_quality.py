@@ -120,7 +120,19 @@ def main():
     if r:
         results.append(r)
 
-    print("\nfeed_flash_c (AVTModel), flash_c/d15_kgm3 (GOModel): formula-only / "
+    # --- GOModel: flash_c (H-C1, 242000:T18) ---
+    flash_tags = GO_SPECS["flash_c"][1]
+    X_flash = tel_go[flash_tags].dropna()
+    left = X_flash.reset_index().rename(columns={X_flash.index.name or "index": "ts"})
+    sub_lims = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "flash_c")][["ts", "value"]].dropna()
+    right = sub_lims.sort_values("ts").rename(columns={"value": "y"})
+    merged = pd.merge_asof(left.sort_values("ts"), right, on="ts",
+                            direction="backward", tolerance=pd.Timedelta(hours=1.0)).dropna().set_index("ts")
+    r = evaluate_output("GOModel", go, "flash_c", merged[flash_tags], merged["y"])
+    if r:
+        results.append(r)
+
+    print("\nfeed_flash_c (AVTModel), d15_kgm3 (GOModel): formula-only / "
           "физическая аппроксимация без обучения -- не в этой таблице, RMSE неприменим.")
 
 

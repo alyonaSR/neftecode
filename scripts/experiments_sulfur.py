@@ -12,8 +12,9 @@
 Эксперименты:
   1. RMSE полной модели (baseline + остаток) против RMSE одной формулы
      на калибровке -- окупает ли себя ML-слой вообще.
-  2. Аблация catalyst_age_days -- главный подозреваемый в переносе
-     temporal drift (29.4% gain, но это буквально функция времени).
+  2. Аблация 242000:Q20 (ПАК сера сырья, найдена Person 2, 2026-09-19) --
+     честная проверка строже, чем просто gain% в дереве: RMSE на
+     калибровке с признаком и без.
   3. corr(feed_d15_kgm3 со сдвигом, ОСТАТОК) -- прошлый аудит лагов
      (scripts/audit_avt_lag_correlation.py) сравнивал с сырой серой,
      а не с тем, что реально видит LightGBM (остаток после baseline).
@@ -35,17 +36,17 @@ import pandas as pd
 from src.data.loaders import TARGET_POINT, load_lims, load_telemetry
 from src.models.avt import AVTModel
 from src.models.conformal import ConformalResidualBounds
-from src.models.features import add_lags, add_rolling, catalyst_age_days
+from src.models.features import add_lags, add_rolling
 from src.models.go import GOModel, sulfur_arrhenius_baseline
+from src.models.go import _SPECS as GO_SPECS
 
 ARTIFACTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "artifacts", "models")
 SULFUR_OUTLIER_THRESHOLD = 20.0
-SULFUR_FEATURES = [
-    "242000:T5", "242000:T5__lag3h", "242000:T5__lag6h",
-    "242000:T5__std3h", "242000:T5__std6h",
-    "catalyst_age_days", "feed_ebp_c", "feed_d15_kgm3",
-]
+# Источник правды -- go.py._SPECS, не дублируем список руками (дублирование
+# и разъехалось в прошлый раз: этот файл не знал о 242000:Q20, добавленной
+# в go.py 2026-09-19, что уронило evaluate_model_quality.py KeyError).
+SULFUR_FEATURES = GO_SPECS["sulfur_mgkg"][1]
 
 
 def as_of_target(X: pd.DataFrame, lims: pd.DataFrame, param: str, tol_h: float = 1.0):
@@ -62,10 +63,9 @@ def build_sulfur_table(avt_model: AVTModel, tel_avt_raw, tel_go, lims, feed_dela
     Та же сборка, что train_go.py, но с опциональным сдвигом feed_ebp_c/
     feed_d15_kgm3 на feed_delay_h назад по времени (эксперимент 3).
     """
-    t5 = tel_go[["242000:T5"]].dropna()
-    t5 = add_lags(t5, ["242000:T5"], lags_h=(3, 6))
+    t5 = tel_go[["242000:T5", "242000:Q20"]].dropna()
+    t5 = add_lags(t5, ["242000:T5", "242000:Q20"], lags_h=(3, 6))
     t5 = add_rolling(t5, ["242000:T5"], windows_h=(3, 6))
-    t5["catalyst_age_days"] = catalyst_age_days(t5.index)
     t5 = t5.dropna()
 
     common_idx = t5.index.intersection(tel_avt_raw.index)
@@ -112,8 +112,16 @@ def experiment_1_ml_value(go: GOModel, X_calib, y_calib):
     print(f"  Улучшение: {100*(1 - rmse_full/rmse_baseline):.1f}%")
 
 
-def experiment_2_catalyst_age_ablation(X_train, y_train, X_calib, y_calib):
-    print("\n=== Эксперимент 2: аблация catalyst_age_days ===")
+def experiment_2_q20_ablation(X_train, y_train, X_calib, y_calib):
+    """
+    Та же методология, что раньше проверяла catalyst_age_days (тот
+    эксперимент сделал своё дело, признак убран из прода 2026-09-16,
+    удалён отсюда). Теперь проверяет 242000:Q20 (ПАК сера сырья,
+    найдена Person 2, 2026-09-19) -- честная аблация строже, чем просто
+    посмотреть gain% в обученной модели: считает RMSE на калибровке
+    с признаком и без, а не только "сколько раз дерево по нему сплитилось".
+    """
+    print("\n=== Эксперимент 2: аблация 242000:Q20 (ПАК сера сырья) ===")
     import lightgbm as lgb
 
     def fit_eval(feature_cols, label):
@@ -139,14 +147,12 @@ def experiment_2_catalyst_age_ablation(X_train, y_train, X_calib, y_calib):
         print(f"  {label}: RMSE={rmse:.3f}  bias(median)={bias:.3f}  топ-фичи={top}")
         return rmse, bias
 
-    # сравниваем как есть в продакшене: T5 и его лаги тоже подаются в
-    # residual-модель (получают 0 importance там, проверено ранее) --
-    # убираем/оставляем только catalyst_age_days
-    with_age = list(SULFUR_FEATURES)
-    without_age = [c for c in SULFUR_FEATURES if c != "catalyst_age_days"]
+    q20_cols = {"242000:Q20", "242000:Q20__lag3h", "242000:Q20__lag6h"}
+    with_q20 = list(SULFUR_FEATURES)
+    without_q20 = [c for c in SULFUR_FEATURES if c not in q20_cols]
 
-    r_with = fit_eval(with_age, "С catalyst_age_days   ")
-    r_without = fit_eval(without_age, "БЕЗ catalyst_age_days ")
+    r_with = fit_eval(with_q20, "С Q20   ")
+    r_without = fit_eval(without_q20, "БЕЗ Q20 ")
     return r_with, r_without
 
 
@@ -202,7 +208,7 @@ def main():
     y_train, y_calib = table.iloc[:cut]["y"], table.iloc[cut:]["y"]
 
     experiment_1_ml_value(go, X_calib, y_calib)
-    experiment_2_catalyst_age_ablation(X_train, y_train, X_calib, y_calib)
+    experiment_2_q20_ablation(X_train, y_train, X_calib, y_calib)
     experiment_3_lagged_feed_d15_vs_residual(avt, tel_avt_raw, tel_go, lims)
     experiment_4_conformal_at_95pct(go)
 

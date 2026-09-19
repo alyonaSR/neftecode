@@ -28,7 +28,7 @@ import pandas as pd
 
 from src.data.loaders import TARGET_POINT, load_lims, load_telemetry
 from src.models.avt import AVTModel
-from src.models.features import add_lags, add_rolling, catalyst_age_days
+from src.models.features import add_lags, add_rolling
 from src.models.go import _SPECS, GOModel
 
 
@@ -57,12 +57,16 @@ def main():
               "сначала. Использую formula-only AVTModel (менее точно).")
         avt_model = AVTModel()
 
-    # --- признаки серы: T5 + лаги/волатильность + catalyst_age + AVT-выход ---
-    print("\nСборка признаков серы (лаги T5, выход AVTModel)...")
-    t5 = tel_go[["242000:T5"]].dropna()
-    t5 = add_lags(t5, ["242000:T5"], lags_h=(3, 6))
+    # --- признаки серы: T5 + лаги/волатильность + Q20 (ПАК сера сырья) + AVT-выход ---
+    # Q20 найдена Person 2 (242000:Q20, 189217 точек, 10 мин шаг) -- ПАК сера
+    # СЫРЬЯ гидроочистки. Раньше сера сырья была видна только из ЛИМС
+    # (132 значения, Mass.Sulfur), теперь непрерывно. Добавлена с лагами по
+    # той же схеме, что T5 -- дать модели шанс найти правильную динамику,
+    # а не гадать заранее (см. models/features.py, тот же паттерн для T5).
+    print("\nСборка признаков серы (лаги T5, Q20 -- сера сырья, выход AVTModel)...")
+    t5 = tel_go[["242000:T5", "242000:Q20"]].dropna()
+    t5 = add_lags(t5, ["242000:T5", "242000:Q20"], lags_h=(3, 6))
     t5 = add_rolling(t5, ["242000:T5"], windows_h=(3, 6))
-    t5["catalyst_age_days"] = catalyst_age_days(t5.index)
     t5 = t5.dropna()
 
     # AVT и 24-2000 синхронны по индексу (README: оба 189217 строк, шаг 10 мин)
@@ -114,6 +118,13 @@ def main():
     table_cfpp = as_of_target(X_cfpp, lims, "cfpp_c")
     print(f"  n={len(table_cfpp)} после as-of join с ЛИМС cfpp")
 
+    # --- признаки flash_c: 242000:T18, готовый ВАК вспышки (H-C1) ---
+    print("\nСборка признаков flash_c (242000:T18)...")
+    flash_tags = _SPECS["flash_c"][1]
+    X_flash = tel_go[flash_tags].dropna()
+    table_flash = as_of_target(X_flash, lims, "flash_c")
+    print(f"  n={len(table_flash)} после as-of join с ЛИМС flash_c")
+
     print("\nОбучение...")
     model = GOModel()
     tables = {}
@@ -125,6 +136,10 @@ def main():
         tables["cfpp_c"] = (table_cfpp[cfpp_tags], table_cfpp["y"])
     else:
         print("  cfpp_c: мало точек, пропуск")
+    if len(table_flash) >= 30:
+        tables["flash_c"] = (table_flash[flash_tags], table_flash["y"])
+    else:
+        print("  flash_c: мало точек, пропуск")
 
     for out, (X, y) in tables.items():
         before = X.apply(lambda r: model._models[out].baseline(r), axis=1)
