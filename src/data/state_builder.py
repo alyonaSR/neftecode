@@ -1,12 +1,4 @@
-"""
-L0. Сборка ProcessState.
-
-Зона ответственности: Person 2 (Data Engineer).
-
-Пока реальный источник не подключён, build_demo_state() отдаёт
-правдоподобные состояния для трёх сценариев из ТЗ. Все остальные
-слои работают на них уже сегодня.
-"""
+"""Сборка ProcessState на момент ts и демо-состояния для сценариев ТЗ."""
 
 from __future__ import annotations
 
@@ -19,34 +11,26 @@ from ..contracts import Measurement, ProcessState
 from .loaders import FEED_POINT, TARGET_POINT, detect_stuck
 from .tags import load_config, refusal_rules
 
-# Три обязательных демо-сценария из раздела 6 ТЗ
+# Демо-сценарии из раздела 6 ТЗ
 SCENARIOS = ("normal", "quality_risk", "degraded_data")
 
 
 def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) -> ProcessState:
-    """
-    ЗАГЛУШКА. Замена на build_state() не затрагивает другие слои:
-    возвращается тот же ProcessState.
-    """
+    """Демо-состояние для сценария из SCENARIOS."""
     if scenario not in SCENARIOS:
         raise ValueError(f"Сценарий должен быть из {SCENARIOS}")
     ts = ts or datetime(2026, 3, 14, 8, 20)
 
-    # базовый режим, значения взяты из реальных диапазонов телеметрии
+    # медианы по истории 2023-2026
     tags: Dict[str, float] = {
-        # медианы по очищенной истории 2023-2026, см. config/constraints.yaml
         "242000:T5": 370.4,     # температура реактора Р-201
-        "242000:F26": 258.6,    # расход сырья объёмный
-        "242000:T18": 68.7,     # похоже на ВА вспышки
-        # Person 3, Stage 2: лаги/волатильность T5 -- сильнейший признак
-        # для серы (std3h corr 0.45 в аудите), смещения от T5 взяты с
-        # реальной строки телеметрии, чтобы не повторить баг Stage 1
-        # (несогласованный синтетический снимок ломал формулу D15)
+        "242000:F26": 258.6,    # расход гидроочищенного ДТ, объёмный
+        "242000:T18": 68.7,     # ВА температуры вспышки ГОДТ
         "242000:T5__lag3h": 366.4,
         "242000:T5__lag6h": 367.8,
         "242000:T5__std3h": 1.95,
         "242000:T5__std6h": 1.68,
-        # теги формулы 24-2000:GODT:CFPP (models/vak_formulas.godt_cfpp)
+        # для формулы ВАК GODT:CFPP
         "242000:T23": 238.2,
         "242000:P8": 0.186,
         "242000:F9": 189.2,
@@ -57,13 +41,11 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
         "AVT:F28": 275.6,       # пар в К-9
         "AVT:F14": 253.5,       # 1 ЦО
         "AVT:P22": 1.12,        # давление верха К-2
-        "AVT:T33": 338.3,       # низ К-2 (признак, не управляемая)
-        "AVT:T71": 304.3,       # температура отбора ДТ (признак)
-        "AVT:F65": 922.4,       # производительность К-2 (возмущение)
-        # Person 3: медианы по очищенной истории, нужны формулам ВАК
-        # (vak_formulas.avt_240_350_ebp, avt_350_d15, avt_350_cfpp)
+        "AVT:T33": 338.3,       # низ К-2
+        "AVT:T71": 304.3,       # температура отбора ДТ
+        "AVT:F65": 922.4,       # производительность К-2
         "AVT:F36": 131.3,
-        "AVT:T66": 254.1,   # нужен avt_240_350_d15 после исправления куска (Stage 2)
+        "AVT:T66": 254.1,
         "AVT:T37": 60.9,
         "AVT:T40": 177.6,
         "AVT:T58": 58.3,
@@ -86,19 +68,13 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
     }
 
     if scenario == "quality_risk":
-        # режим утяжелился: больше отбор ДТ, ниже температура реактора
         tags["AVT:F30"] = 141.0     # отбор поднят, хвост тяжелее
         tags["AVT:F32"] = 89.0
-        tags["242000:T5"] = 366.5   # температура реактора ниже обычной
-        # ТЗ просит период РИСКА ухудшения, а не свершившегося нарушения:
-        # запас до лимита есть, но меньше целевого, поэтому система обязана
-        # действовать. Уже нарушенную спеку проверяет отдельный тест
-        # режима восстановления (tests/test_integration.py).
+        tags["242000:T5"] = 366.5   # реактор холоднее, очистка хуже
         pak["sulfur_mgkg"] = Measurement(9.3, ts, 0.0, "PAK", "mg/kg")
         lims["sulfur_mgkg"] = Measurement(9.2, ts - timedelta(hours=9), 540.0, "LIMS", "mg/kg")
 
     if scenario == "degraded_data":
-        # ЛИМС протух, ПАК залип
         lims["sulfur_mgkg"] = Measurement(8.2, ts - timedelta(hours=52), 3120.0, "LIMS", "mg/kg")
         pak["sulfur_mgkg"] = Measurement(8.37, ts, 0.0, "PAK", "mg/kg", healthy=False)
         pak["d15_kgm3"] = Measurement(None, None, None, "PAK", "kg/m3", healthy=False)
@@ -111,10 +87,7 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
     return ProcessState(ts=ts, tags=tags, lims=lims, pak=pak, dq_flags=dq_flags)
 
 
-TAG_STALE_MIN = 30.0     # тег старше получаса -> кладём, но поднимаем флаг
-
-
-TAG_STALE_MIN = 30.0     # тег старше получаса -> кладём, но поднимаем флаг
+TAG_STALE_MIN = 30.0  # мин; тег старше попадает во флаги
 
 
 def build_state(
@@ -123,17 +96,7 @@ def build_state(
     lims_long: pd.DataFrame,
     pak_long: pd.DataFrame,
 ) -> ProcessState:
-    """
-    РЕАЛЬНАЯ сборка ProcessState на момент ts.
-
-    ЕДИНСТВЕННОЕ ЖЁСТКОЕ ПРАВИЛО: ничего строго позже ts.
-    Ни телеметрии, ни ЛИМС, ни ПАК. Никакой интерполяции, никакого bfill.
-    Всё, что попадает в состояние, было известно оператору в момент ts.
-
-    telemetry — DatetimeIndex, колонки вида 'AVT:T33'
-    lims_long — длинный фрейм из load_lims()
-    pak_long  — длинный фрейм из load_pak()
-    """
+    """ProcessState на момент ts: только данные не позже ts, без интерполяции."""
     ts = pd.Timestamp(ts)
     flags: List[str] = []
 
@@ -145,13 +108,7 @@ def build_state(
 
 
 def _slice_telemetry(ts, telemetry: pd.DataFrame, flags: List[str]) -> Dict[str, float]:
-    """
-    По каждому тегу — последнее непустое значение не позже ts.
-
-    Именно по каждому, а не одна строка целиком: в строке на ts часть
-    датчиков может быть в NaN, и брать её как есть значило бы потерять
-    половину состояния.
-    """
+    """Последнее непустое значение каждого тега не позже ts."""
     tags: Dict[str, float] = {}
     if telemetry is None or telemetry.empty:
         flags.append("телеметрия не передана")
@@ -181,12 +138,7 @@ def _slice_telemetry(ts, telemetry: pd.DataFrame, flags: List[str]) -> Dict[str,
 
 
 def _latest_lims(ts, lims_long: pd.DataFrame, flags: List[str]) -> Dict[str, Measurement]:
-    """
-    Последний лабораторный результат по каждому показателю товарной точки.
-
-    Сера в сырье гидроочистки кладётся под префиксом feed:, иначе она
-    перезатёрла бы товарную (9460 мг/кг против 8.6) и всё поехало бы.
-    """
+    """Последний анализ ЛИМС не позже ts. Сера сырья под ключом 'feed:sulfur_mgkg'."""
     out: Dict[str, Measurement] = {}
     if lims_long is None or lims_long.empty:
         flags.append("ЛИМС не передан")
@@ -221,13 +173,7 @@ def _latest_lims(ts, lims_long: pd.DataFrame, flags: List[str]) -> Dict[str, Mea
 
 
 def _latest_pak(ts, pak_long: pd.DataFrame, flags: List[str]) -> Dict[str, Measurement]:
-    """
-    Последнее показание каждого поточного анализатора.
-
-    Значение кладётся ВСЕГДА, даже если анализатор залип: контракт
-    требует сохранить его с healthy=False, а не выбросить. Решение,
-    доверять ли ему, принимает потребитель.
-    """
+    """Последнее показание каждого ПАК не позже ts. Залипшее хранится с healthy=False."""
     out: Dict[str, Measurement] = {}
     if pak_long is None or pak_long.empty:
         flags.append("ПАК не передан")
@@ -255,7 +201,7 @@ def _latest_pak(ts, pak_long: pd.DataFrame, flags: List[str]) -> Dict[str, Measu
 
 
 def scan_data_quality(df: pd.DataFrame, freq_min: int = 10) -> List[str]:
-    """Быстрый отчёт о качестве среза. Результат идёт в dq_flags."""
+    """Флаги по колонкам с пропусками больше 5% и залипанием."""
     flags: List[str] = []
     for col in df.columns:
         s = df[col]

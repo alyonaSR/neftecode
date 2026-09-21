@@ -1,6 +1,4 @@
-_comment: Сгенерировано src/agents/calibrate_reliability.py по всей истории телеметрии.
-  Severity = перцентильный ранг текущего режима, поэтому медианный режим даёт ~0.5
-  и класс normal по построению.
+_comment: Сгенерировано src/agents/calibrate_reliability.py, вручную не править.
 grid:
 - 0
 - 5

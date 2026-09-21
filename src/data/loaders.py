@@ -1,16 +1,4 @@
-"""
-Загрузка сырых источников.
-
-Зона ответственности: Person 2 (Data Engineer).
-
-СТАТУС: каркас. Функции читают файлы и приводят к единому виду,
-но разбор шапки ЛИМС и калибровка ПАК помечены TODO.
-
-ПРАВИЛА (из ТЗ, нарушать нельзя):
-  - синхронизация ТОЛЬКО по времени, никогда по номеру строки
-  - возраст анализа хранить всегда
-  - единицы указывать явно
-"""
+"""Загрузка телеметрии, ЛИМС и ПАК."""
 
 from __future__ import annotations
 
@@ -27,27 +15,17 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 
 
 def _path(fname: str) -> str:
+    """Путь к файлу в data/."""
     return os.path.join(DATA_DIR, fname)
 
 
-
-# --------------------------------------------------------------------------
-# Справочники ЛИМС. Person 2.
-# --------------------------------------------------------------------------
-
-# Товарный продукт. Две точки после слова "Гидроочистка" — это не опечатка,
-# так в выгрузке. Именно здесь Mg.Sulfur, главный жёсткий показатель.
+# Товарное ДТ. Две точки после слова "Гидроочистка", как в выгрузке.
 TARGET_POINT = "Установка 'Гидроочистка'.. Точка отбора '2'. Продукт 'Дизельное топливо'"
 
-# Сырьё гидроочистки. Mass.Sulfur здесь — сера НА ВХОДЕ, сильнейший
-# предиктор серы на выходе. Значений мало (132), но признак ценный.
+# Сырьё гидроочистки.
 FEED_POINT = "Установка 'Гидроочистка'. Точка отбора '1'. Продукт 'ФРАКЦ_ДИЗ'."
 
-# raw_param -> (канонический ключ, единицы, множитель конверсии)
-#
-# ЕДИНИЦЫ БЕРЁМ ОТСЮДА, А НЕ ИЗ ФАЙЛА: строка 2 выгрузки съехала.
-# Проверено: 50%.T подписан как кг/м3, EBP.T как "% об.", D15 как °С.
-# Канонические ключи обязаны совпадать с QualityAssess.predictions.
+# raw_param -> (ключ, единицы, множитель). Единицы в выгрузке съехали, задаём их здесь.
 LIMS_PARAM_MAP = {
     "Mg.Sulfur":            ("sulfur_mgkg", "mg/kg", 1.0),
     "Mass.Sulfur":          ("sulfur_mgkg", "mg/kg", 10_000.0),   # % масс -> мг/кг
@@ -68,8 +46,7 @@ LIMS_PARAM_MAP = {
     "CetaneNumber":         ("cetane",      "-",     1.0),
 }
 
-# Физически возможные значения. Выход за границы НЕ удаляется,
-# а помечается флагом outlier: след сохраняется, фильтрует потребитель.
+# Физически возможные диапазоны. Выход за них помечается outlier, строка не удаляется.
 PLAUSIBLE = {
     "sulfur_mgkg": (0.0, 5000.0),
     "d15_kgm3":    (700.0, 950.0),
@@ -88,9 +65,7 @@ PLAUSIBLE = {
 }
 
 
-# raw-имя колонки ПАК -> (канонический ключ, единицы, множитель)
-# ppm по массе тождественно равен мг/кг: множитель 1.0, но конверсия
-# зафиксирована явно, ТЗ требует воспроизводимости пересчётов.
+# raw-имя сигнала ПАК -> (ключ, единицы, множитель). ppm = мг/кг.
 PAK_PARAM_MAP = {
     "24-2000:Mg.Sulfur": ("sulfur_mgkg", "mg/kg", 1.0),
     "24-2000:D15":       ("d15_kgm3",    "kg/m3", 1.0),
@@ -98,18 +73,12 @@ PAK_PARAM_MAP = {
 
 PAK_COLUMNS = ["ts", "param", "raw_param", "value", "units", "healthy", "outlier"]
 
-PAK_STUCK_MIN_POINTS = 6      # 6 точек по 10 минут = час без изменения значения
-
+PAK_STUCK_MIN_POINTS = 6  # час при шаге 10 мин
 LIMS_COLUMNS = ["ts", "sample_point", "param", "raw_param", "value", "units", "outlier"]
 
 
 def load_telemetry(unit: str) -> pd.DataFrame:
-    """
-    unit: 'AVT' | '242000'
-
-    Возвращает DataFrame с DatetimeIndex и колонками вида 'AVT:T33'.
-    Служебные колонки Unnamed:* выбрасываются.
-    """
+    """Телеметрия установки ('AVT' | '242000'): DatetimeIndex, колонки вида 'AVT:T33'."""
     cfg = load_config("tags")
     fname = {"AVT": "avt_tags.csv", "242000": "242000_tags.csv"}[unit]
     df = pd.read_csv(_path(fname))
@@ -127,25 +96,11 @@ def load_telemetry(unit: str) -> pd.DataFrame:
 
 
 def _clean_sentinels(df: pd.DataFrame, unit: str, cfg: dict) -> pd.DataFrame:
-    """
-    Маркеры шкалы и физически невозможные значения.
-
-    ПРАВИЛО ПО ОТРИЦАТЕЛЬНЫМ (проверено на avt_tags.csv):
-      прежнее "всё отрицательное -> NaN" калечило данные. У AVT:P52
-      65% значений это -0.00, у AVT:F69 отрицательные не глубже -0.45
-      при p99 = 307. Это дрожание нуля, а не аномалия.
-
-      Поэтому масштабный порог: 2% от p99 колонки.
-        |x| < порога  -> 0    (прибор дрожит около нуля, расхода нет)
-        x < -порога   -> NaN  (только для расходов: F/W/Q; для давлений
-                               и перепадов крупный минус может быть физикой)
-
-    Маркер шкалы считаем маркером, только если он реально является
-    максимумом колонки.
-    """
+    """Маркеры шкалы в NaN, отрицательные значения по порогу от p99 колонки."""
     out = df.copy()
     sentinels = cfg.get("sentinel_values", [])
     rule = cfg.get("negative_rule", {}) or {}
+    # |x| < порога -> 0; у расходов x < -порога -> NaN
     share = float(rule.get("noise_share_of_p99", 0.02))
     nan_prefixes = tuple(rule.get("nan_below_threshold_prefixes", ["F", "W", "Q"]))
     zero_prefixes = tuple(rule.get("zero_clip_prefixes", ["F", "W", "Q", "P", "L", "D"]))
@@ -155,13 +110,14 @@ def _clean_sentinels(df: pd.DataFrame, unit: str, cfg: dict) -> pd.DataFrame:
         if not pd.api.types.is_numeric_dtype(s):
             continue
 
+        # маркер, только если это максимум колонки
         for sv in sentinels:
             if np.isclose(s.max(skipna=True), sv, atol=1e-6):
                 s = s.mask(np.isclose(s, sv, atol=1e-6))
 
         p99 = s.quantile(0.99)
         if pd.notna(p99) and p99 > 0 and col.startswith(zero_prefixes):
-            # температуры сюда не попадают: -5 degC это физика, а не дрожание нуля
+            # температуры не трогаем
             thr = share * float(p99)
             s = s.mask(s.between(-thr, 0, inclusive="left"), 0.0)
             if col.startswith(nan_prefixes):
@@ -172,19 +128,7 @@ def _clean_sentinels(df: pd.DataFrame, unit: str, cfg: dict) -> pd.DataFrame:
 
 
 def load_lims(path: Optional[str] = None, return_report: bool = False):
-    """
-    Разбор ЛИМС в длинный формат:
-        ts | sample_point | param | raw_param | value | units | outlier
-
-    Структура файла (проверена на выгрузке 1522 x 108):
-      строка 0 — точка отбора, заполнена только в первой колонке блока
-      строка 1 — код показателя, только в чётной колонке
-      строка 2 — единицы, СЪЕХАВШИЕ, не используются
-      строка 3 — в нечётной колонке объявленное количество значений
-      строка 4+ — данные, колонки парами (дата, значение)
-
-    return_report=True дополнительно отдаёт сверку declared vs parsed.
-    """
+    """ЛИМС в длинном формате. С return_report=True ещё сверка declared и parsed."""
     path = path or _lims_path()
     raw = pd.read_excel(path, header=None)
 
@@ -215,7 +159,7 @@ def load_lims(path: Optional[str] = None, return_report: bool = False):
 
         parsed = len(block)
 
-        # дубликаты по метке времени: пересдача отменяет первый результат
+        # при дубле метки берём последний результат
         dupes = int(block["ts"].duplicated().sum())
         block = block.drop_duplicates(subset="ts", keep="last")
 
@@ -249,10 +193,7 @@ def load_lims(path: Optional[str] = None, return_report: bool = False):
 
     out = pd.concat(frames, ignore_index=True)
 
-    # после конкатенации ключ (точка, показатель, время) обязан быть уникальным,
-    # иначе merge_asof возьмёт произвольную строку и результат перестанет быть
-    # воспроизводимым. CloudPoint и CloudPoint_1 маплю в один cloud_c, поэтому
-    # пересечения возможны.
+    # CloudPoint и CloudPoint_1 оба дают cloud_c: ключ делаем уникальным
     out = (
         out.sort_values(["sample_point", "param", "ts"])
         .drop_duplicates(subset=["sample_point", "param", "ts"], keep="last")
@@ -265,13 +206,7 @@ def load_lims(path: Optional[str] = None, return_report: bool = False):
 
 
 def _find_data_file(*patterns: str) -> str:
-    """
-    Поиск файла в data/ по маске, без привязки к точному имени.
-
-    Организаторы раздали всем одинаковые файлы, но имена у них длинные
-    и с пробелами. Переименовывать нельзя: у четверых получится
-    четыре разных имени и четыре разных бага. Поэтому ищем по маске.
-    """
+    """Первый файл в data/ по маске."""
     import glob
 
     seen = []
@@ -288,29 +223,17 @@ def _find_data_file(*patterns: str) -> str:
 
 
 def _lims_path() -> str:
+    """Путь к выгрузке ЛИМС в data/."""
     return _find_data_file("*ЛИМС*.xlsx", "*lims*.xlsx", "*LIMS*.xlsx")
 
 
 def _pak_path() -> str:
+    """Путь к выгрузке ПАК в data/."""
     return _find_data_file("*ПАК*.xlsx", "*pak*.xlsx", "*PAK*.xlsx")
 
 
 def load_pak(path: Optional[str] = None, return_report: bool = False):
-    """
-    Поточные анализаторы в длинный формат:
-        ts | param | raw_param | value | units | healthy | outlier
-
-    Структура файла:
-      строка 0 — имя сигнала, только в колонке с датами
-      строка 1 — единицы
-      строка 2+ — данные, колонки парами (дата, значение)
-
-    ВАЖНО: между парами есть пустая колонка-разделитель, поэтому пары
-    ищутся по непустым заголовкам, а не шагом 2 как в ЛИМС.
-
-    Временная сетка НЕ выравнивается: загрузчик отдаёт факты, решение
-    о заполнении пропусков принимает слой признаков.
-    """
+    """ПАК в длинном формате. С return_report=True ещё отчёт по сигналам."""
     path = path or _pak_path()
     raw = pd.read_excel(path, header=None)
 
@@ -339,7 +262,6 @@ def load_pak(path: Optional[str] = None, return_report: bool = False):
         block = block.sort_values("ts").drop_duplicates(subset="ts", keep="last")
         block["value"] = block["value"] * factor
 
-        # залипание считаем по упорядоченному во времени ряду, иначе diff врёт
         stuck = detect_stuck(block["value"], min_points=PAK_STUCK_MIN_POINTS)
         block["healthy"] = ~stuck.values
 
@@ -374,12 +296,7 @@ def load_pak(path: Optional[str] = None, return_report: bool = False):
 
 
 def stuck_episodes(pak: pd.DataFrame, param: str = "sulfur_mgkg") -> pd.DataFrame:
-    """
-    Границы эпизодов залипания: начало, конец, длительность.
-
-    Отсюда Person 1 берёт конкретные ts для демо-сценария
-    'неполные / аномальные данные'.
-    """
+    """Эпизоды залипания анализатора: начало, конец, точки, часы."""
     s = pak[pak["param"] == param].sort_values("ts").reset_index(drop=True)
     bad = ~s["healthy"]
     if not bad.any():
@@ -398,13 +315,7 @@ def stuck_episodes(pak: pd.DataFrame, param: str = "sulfur_mgkg") -> pd.DataFram
 
 
 def detect_stuck(s: pd.Series, min_points: int = 6) -> pd.Series:
-    """
-    Детектор залипшего анализатора. Возвращает булеву маску 'значение мёртвое'.
-
-    min_points=6 при шаге 10 минут = один час без изменения значения.
-    Реализация целиком, без заглушки: это готовый демо-сценарий
-    'неполные или аномальные данные' из ТЗ.
-    """
+    """Маска повторов в сериях от min_points значений. Первое значение серии не помечается."""
     same_as_prev = s.diff().eq(0)
     grp = (~same_as_prev).cumsum()
     run_len = same_as_prev.groupby(grp).transform("sum")
@@ -417,14 +328,7 @@ def asof_join(
     param: str,
     tolerance_h: float = 72.0,
 ) -> pd.DataFrame:
-    """
-    As-of join лабораторных данных к телеметрии. ТОЛЬКО назад по времени.
-
-    Добавляет колонки <param>__value и <param>__age_min.
-    Возраст анализа — обязательное поле, не примечание: если ЛИМС
-    18-часовой давности, а режим меняли 4 часа назад, этот анализ
-    ничего не говорит о текущем продукте.
-    """
+    """As-of join ЛИМС к телеметрии только назад по времени. Добавляет __value, __meas_ts, __age_min."""
     left = telemetry.reset_index().rename(columns={telemetry.index.name or "index": "ts"})
     right = (
         lab[lab["param"] == param][["ts", "value"]]
