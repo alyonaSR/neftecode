@@ -950,6 +950,716 @@ def experiment_14_skill_vs_constant(table: pd.DataFrame, go: GOModel, tel_go: pd
         print("     в данных ЕСТЬ: ПАК Q21 предсказывает ЛИМС заметно лучше константы.")
 
 
+def experiment_15_baseline_choice(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-M1: базовая формула тянет модель вниз?
+
+    Повод: в эксп.14 аррениусовский baseline сам по себе дал RMSE 2.604 --
+    заметно ХУЖЕ константы (1.935). Остаток учится поверх систематически
+    плохой опоры.
+
+    Возражение, которое надо снять: остаток ведь может сам скомпенсировать
+    формулу, ведь T5 -- признак модели, а baseline -- функция от T5.
+    Но не может, если мешает monotone-ограничение: baseline убывает по T5,
+    и EXPECTED_SIGNS["sulfur_mgkg"]["242000:T5"] = -1 заставляет остаток
+    тоже НЕ возрастать по T5. Если формула переотвечает на температуру,
+    ограниченный остаток НЕ ИМЕЕТ ПРАВА отыграть это назад. Поэтому схема
+    2x2: {baseline: формула / константа} x {monotone: вкл / выкл}.
+
+    Плюс отдельный вариант: линейная перекалибровка формулы на трейне
+    (a + b*формула). Если он чинит дело -- у формулы верная ФОРМА, но
+    неверные масштаб и сдвиг, и это чинится двумя коэффициентами.
+
+    Протокол -- walk-forward из эксп.14 (5 блоков, переобучение в каждом),
+    и в каждом блоке рядом печатается КОНСТАНТА: после H-K3 всё меряется
+    против неё, а не против прошлой версии модели.
+    """
+    print("\n=== Эксперимент 15 (H-M1): выбор baseline и цена monotone ===")
+    import lightgbm as lgb
+    from src.models.base import monotone_vector
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    mono = monotone_vector(SULFUR_FEATURES, "sulfur_mgkg")
+    samples = np.sort(tbl["_lims_ts"].unique())
+    bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
+
+    def formula(df):
+        return df[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+
+    variants = ["формула+mono", "формула", "константа+mono", "константа", "перекалибр.+mono"]
+    acc = {v: [] for v in variants}
+    acc["КОНСТАНТА"] = []
+
+    for i in range(5):
+        lo_i, hi_i = bounds[i], bounds[i + 1]
+        cut_lo, cut_hi = samples[lo_i], samples[hi_i - 1]
+        tr = tbl[tbl["_lims_ts"] < cut_lo]
+        te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
+        if len(tr) < 200 or len(te) < 20:
+            continue
+        y_tr, y_te = tr["y"], te["y"]
+        Xtr = tr[SULFUR_FEATURES].rename(columns=safe)
+        Xte = te[SULFUR_FEATURES].rename(columns=safe)
+        f_tr, f_te = formula(tr), formula(te)
+        const = float(y_tr.mean())
+        # линейная перекалибровка формулы на трейне
+        b, a = np.polyfit(f_tr.values, y_tr.values, 1)
+        rc_tr, rc_te = a + b * f_tr, a + b * f_te
+
+        bases = {"формула+mono": (f_tr, f_te, mono), "формула": (f_tr, f_te, None),
+                 "константа+mono": (const, const, mono), "константа": (const, const, None),
+                 "перекалибр.+mono": (rc_tr, rc_te, mono)}
+        for name, (btr, bte, mc) in bases.items():
+            kw = {"monotone_constraints": mc} if mc is not None else {}
+            m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                   num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                                   random_state=42, verbose=-1, **kw)
+            m.fit(Xtr, y_tr - btr)
+            pred = bte + m.predict(Xte)
+            acc[name].append(float(np.sqrt(((pred - y_te) ** 2).mean())))
+        acc["КОНСТАНТА"].append(float(np.sqrt(((const - y_te) ** 2).mean())))
+
+    n_blocks = len(acc["КОНСТАНТА"])
+    print(f"  {'вариант':<20}" + "".join(f"{'бл.'+str(i+1):>9}" for i in range(n_blocks))
+          + f"{'среднее':>10}{'skill':>8}{'бьёт конст.':>13}")
+    base_const = np.array(acc["КОНСТАНТА"])
+    for name in ["КОНСТАНТА"] + variants:
+        v = np.array(acc[name])
+        mean = v.mean()
+        skill = 100 * (1 - mean / base_const.mean())
+        wins = int((v < base_const).sum())
+        tag = f"{wins}/{n_blocks}" if name != "КОНСТАНТА" else "--"
+        print(f"  {name:<20}" + "".join(f"{x:>9.3f}" for x in v)
+              + f"{mean:>10.3f}{skill:>+7.1f}%{tag:>13}")
+
+    print()
+    best = min(variants, key=lambda k: np.mean(acc[k]))
+    print(f"  лучший вариант: {best} ({np.mean(acc[best]):.3f}), "
+          f"текущий прод: формула+mono ({np.mean(acc['формула+mono']):.3f})")
+    d_mono = np.mean(acc["формула"]) - np.mean(acc["формула+mono"])
+    d_base = np.mean(acc["константа+mono"]) - np.mean(acc["формула+mono"])
+    print(f"  цена monotone при формуле: {d_mono:+.3f} "
+          f"(отрицательно = без ограничений лучше)")
+    print(f"  эффект замены формулы на константу (при mono): {d_base:+.3f} "
+          f"(отрицательно = константа лучше)")
+
+
+def experiment_16_capacity_and_dedup(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-M2: модель переглажена -- или сигнала в признаках просто нет?
+
+    Эксп.15 показал, что ML-слой поверх КОНСТАНТНОГО baseline даёт 1.962
+    против 1.935 у самой константы, то есть слой не просто бесполезен, а
+    слегка вреден. Два принципиально разных объяснения:
+
+      (а) НЕДООБУЧЕНИЕ. min_child_samples = n//50 = 201, но эффективная
+          выборка (H-H1) -- 1444 пробы, не 10 056 строк, значит на лист
+          приходится ~29 независимых наблюдений. Дерево вырождается почти
+          в константу. Лечится ёмкостью.
+      (б) СИГНАЛА НЕТ. Признаки-условия процесса не предсказывают лабораторную
+          серу вне периода обучения. Ёмкость не поможет, лечится только
+          другими входами.
+
+    Различаются они ошибкой НА ТРЕЙНЕ: при (а) train RMSE тоже высок, при
+    (б) train RMSE низок, а test -- нет. Поэтому печатаем обе.
+
+    Дополнительно -- дедупликация до одной строки на пробу (веса вместо
+    семикратного дублирования метки), чего H-H1 касалась лишь на одном сплите.
+    """
+    print("\n=== Эксперимент 16 (H-M2): ёмкость модели и дедупликация ===")
+    import lightgbm as lgb
+    from src.models.base import monotone_vector
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    mono = monotone_vector(SULFUR_FEATURES, "sulfur_mgkg")
+    samples = np.sort(tbl["_lims_ts"].unique())
+    bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
+
+    # (mcs_divisor, max_depth, num_leaves, дедуплицировать?)
+    cfgs = [("прод: mcs=n/50, d4", 50, 4, 15, False),
+            ("mcs=n/150, d4",     150, 4, 15, False),
+            ("mcs=n/300, d6",     300, 6, 31, False),
+            ("mcs=20, d8 (много)", None, 8, 63, False),
+            ("дедуп + mcs=n/50",   50, 4, 15, True),
+            ("дедуп + mcs=20, d8", None, 8, 63, True)]
+
+    res = {c[0]: {"tr": [], "te": []} for c in cfgs}
+    const_te = []
+
+    for i in range(5):
+        lo_i, hi_i = bounds[i], bounds[i + 1]
+        cut_lo, cut_hi = samples[lo_i], samples[hi_i - 1]
+        tr_all = tbl[tbl["_lims_ts"] < cut_lo]
+        te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
+        if len(tr_all) < 200 or len(te) < 20:
+            continue
+        const = float(tr_all["y"].mean())
+        const_te.append(float(np.sqrt(((const - te["y"]) ** 2).mean())))
+        Xte = te[SULFUR_FEATURES].rename(columns=safe)
+
+        for name, div, depth, leaves, dedup in cfgs:
+            tr = (tr_all.groupby("_lims_ts").first().reset_index() if dedup else tr_all)
+            mcs = 20 if div is None else max(5, len(tr) // div)
+            Xtr = tr[SULFUR_FEATURES].rename(columns=safe)
+            m = lgb.LGBMRegressor(n_estimators=200, max_depth=depth, learning_rate=0.05,
+                                   num_leaves=leaves, min_child_samples=mcs,
+                                   monotone_constraints=mono, random_state=42, verbose=-1)
+            m.fit(Xtr, tr["y"] - const)
+            p_tr = const + m.predict(Xtr)
+            p_te = const + m.predict(Xte)
+            res[name]["tr"].append(float(np.sqrt(((p_tr - tr["y"]) ** 2).mean())))
+            res[name]["te"].append(float(np.sqrt(((p_te - te["y"]) ** 2).mean())))
+
+    c_mean = float(np.mean(const_te))
+    print(f"  константа (эталон): test RMSE = {c_mean:.3f}\n")
+    print(f"  {'конфигурация':<22}{'train':>8}{'test':>8}{'зазор':>8}{'skill':>8}{'бьёт конст.':>13}")
+    for name, *_ in cfgs:
+        tr_m, te_m = float(np.mean(res[name]["tr"])), float(np.mean(res[name]["te"]))
+        wins = int((np.array(res[name]["te"]) < np.array(const_te)).sum())
+        print(f"  {name:<22}{tr_m:>8.3f}{te_m:>8.3f}{te_m-tr_m:>8.3f}"
+              f"{100*(1-te_m/c_mean):>+7.1f}%{str(wins)+'/'+str(len(const_te)):>13}")
+
+    print()
+    prod = float(np.mean(res["прод: mcs=n/50, d4"]["tr"]))
+    big = float(np.mean(res["mcs=20, d8 (много)"]["tr"]))
+    print(f"  train RMSE: прод {prod:.3f} -> самая ёмкая {big:.3f}")
+    if big < prod - 0.2:
+        print("  => ёмкости ХВАТАЕТ: ёмкая модель уверенно запоминает трейн,")
+        print("     но это не переносится на тест. Значит дело НЕ в переглаженности,")
+        print("     а в том, что признаки-условия процесса не переносятся во времени.")
+    else:
+        print("  => модель НЕ МОЖЕТ подогнать даже трейн -- недообучение/нет сигнала.")
+
+
+def experiment_17_gate_decision_matrix(table_full: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-J1: метрика ПРОДУКТА, а не прогноза.
+
+    За всю кампанию всё меряли в RMSE, но Gate принимает БИНАРНОЕ решение:
+    по config/constraints.yaml для sulfur_mgkg limit=10.0, direction=max,
+    check_on=hi -- то есть партия отклоняется, если ВЕРХНЯЯ граница
+    конформного интервала превышает 10 мг/кг. Среднее Gate вообще не смотрит.
+
+    Отсюда две принципиально разные ошибки:
+      ЛОЖНЫЙ ПРОПУСК  -- Gate сказал ОК, а ЛИМС показал > 10. Внеспековое
+                         топливо ушло потребителю. Катастрофа, цена высокая.
+      ЛОЖНЫЙ ОТКАЗ    -- Gate забраковал нормальную партию. Упущенная
+                         выручка / лишняя жёсткость режима. Цена умеренная.
+
+    Это единственная метрика, по которой отсутствие навыка в среднем
+    (H-K3) может оказаться неважным: консервативный hi держится конформным
+    интервалом, а не точностью среднего.
+
+    Для сравнения считается тот же Gate поверх КОНСТАНТНОГО прогноза
+    (среднее трейна + конформный интервал по той же калибровке). Если
+    матрицы совпадут -- модель не добавляет ценности и на уровне решений.
+
+    ВАЖНО: обучение фильтрует выбросы > 20 мг/кг (как в проде), но
+    ОЦЕНКА идёт по НЕфильтрованным меткам: точки y > 20 -- это и есть
+    настоящие внеспековые события, ради которых Gate существует.
+    """
+    print("\n=== Эксперимент 17 (H-J1): матрица решений Gate ===")
+    LIMIT = 10.0
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    left = pd.DataFrame({"ts": table_full.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table_full.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
+    spec = GO_SPECS["sulfur_mgkg"]
+    from src.models.base import monotone_vector
+
+    cells = {k: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for k in ("модель", "константа")}
+    n_off = n_tot = 0
+
+    for i in range(5):
+        lo_i, hi_i = bounds[i], bounds[i + 1]
+        cut_lo, cut_hi = samples[lo_i], samples[hi_i - 1]
+        tr = tbl[tbl["_lims_ts"] < cut_lo]
+        te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
+        if len(tr) < 200 or len(te) < 20:
+            continue
+        tr_fit = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]      # как в проде
+
+        sub = FormulaPlusResidual(name="sulfur_mgkg", formula_fn=spec[0],
+                                   formula_tags=spec[1], feature_cols=spec[1],
+                                   fallback_mean=spec[2],
+                                   monotone=monotone_vector(spec[1], "sulfur_mgkg"))
+        sub.fit(tr_fit[SULFUR_FEATURES], tr_fit["y"])
+
+        # константный "прогноз" + конформный интервал по той же калибровке
+        n_tr = len(tr_fit)
+        c_cut = int(n_tr * 0.8)
+        const = float(tr_fit["y"].iloc[:c_cut].mean())
+        calib_err = tr_fit["y"].iloc[c_cut:].values - const
+        cb = ConformalResidualBounds().fit(calib_err - np.median(calib_err))
+        off_lo, off_hi = cb.bounds()
+        const_hi = const + float(np.median(calib_err)) + off_hi
+
+        for _, r in te.iterrows():
+            y = float(r["y"])
+            off = y > LIMIT
+            n_off += off
+            n_tot += 1
+            hi_model = sub.predict_one(r[SULFUR_FEATURES].to_dict()).hi
+            for key, hi in (("модель", hi_model), ("константа", const_hi)):
+                reject = hi > LIMIT
+                if reject and off:      cells[key]["TP"] += 1
+                elif reject and not off: cells[key]["FP"] += 1
+                elif not reject and off: cells[key]["FN"] += 1
+                else:                    cells[key]["TN"] += 1
+
+    print(f"  всего проверок={n_tot}, из них реально внеспековых (ЛИМС>10)={n_off} "
+          f"({100*n_off/max(n_tot,1):.1f}%)\n")
+    for key, c in cells.items():
+        tot, off = c["TP"] + c["FP"] + c["FN"] + c["TN"], c["TP"] + c["FN"]
+        ok = c["FP"] + c["TN"]
+        print(f"  --- Gate поверх: {key} ---")
+        print(f"    ЛОЖНЫХ ПРОПУСКОВ (брак ушёл):   {c['FN']:>5}  "
+              f"= {100*c['FN']/max(off,1):.1f}% от всех внеспековых")
+        print(f"    пойманных внеспековых:          {c['TP']:>5}  "
+              f"= {100*c['TP']/max(off,1):.1f}%")
+        print(f"    ложных отказов (зря забракован):{c['FP']:>5}  "
+              f"= {100*c['FP']/max(ok,1):.1f}% от нормальных партий")
+        print(f"    доля отказов всего:             {100*(c['TP']+c['FP'])/max(tot,1):.1f}%")
+    d_fn = cells["модель"]["FN"] - cells["константа"]["FN"]
+    d_fp = cells["модель"]["FP"] - cells["константа"]["FP"]
+    print(f"\n  модель против константы: ложных пропусков {d_fn:+d}, ложных отказов {d_fp:+d}")
+
+    c = cells["модель"]
+    tpr = c["TP"] / max(c["TP"] + c["FN"], 1)
+    fpr = c["FP"] / max(c["FP"] + c["TN"], 1)
+    print(f"  различающая способность Gate: TPR={100*tpr:.1f}% против FPR={100*fpr:.1f}%, "
+          f"Youden J={100*(tpr-fpr):+.1f} п.п.")
+    print("  (у бесполезного классификатора TPR=FPR, то есть J=0)")
+
+
+def experiment_18_discrimination_auc(table_full: pd.DataFrame, tel_go: pd.DataFrame,
+                                      lims: pd.DataFrame):
+    """
+    Достройка H-J1. Матрица решений смешивает два разных вопроса:
+      (1) удачно ли выбран ПОРОГ (ширина конформного интервала),
+      (2) есть ли у прогноза РАЗЛИЧАЮЩАЯ СПОСОБНОСТЬ в принципе.
+
+    AUC отвечает только на (2): это вероятность, что случайно взятая
+    внеспековая партия получит прогноз выше, чем случайно взятая нормальная.
+    AUC=0.5 -- монета, различения нет ни при каком пороге; AUC=1.0 -- идеал.
+
+    Если у модели AUC близок к 0.5, а у ПАК Q21 заметно выше -- история та
+    же, что с RMSE (H-K3), и порог тут ни при чём.
+
+    Отдельно считается ПОТОЛОК различения: метка "ЛИМС > 10" сама шумная,
+    sigma_ЛИМС ~ 1.16 (H-K1), поэтому даже идеальный прогноз истинной серы
+    не даст AUC=1. Оцениваем симуляцией: берём ЛИМС как истину, добавляем
+    независимый шум sigma_ЛИМС и смотрим AUC такого "идеального прибора".
+    """
+    print("\n=== Эксперимент 18 (H-J1, достройка): различающая способность ===")
+    import lightgbm as lgb
+    from src.models.base import monotone_vector
+    LIMIT = 10.0
+
+    def auc(score, label):
+        score, label = np.asarray(score, float), np.asarray(label, bool)
+        n_pos, n_neg = label.sum(), (~label).sum()
+        if n_pos == 0 or n_neg == 0:
+            return float("nan")
+        r = pd.Series(score).rank().values
+        return float((r[label].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    left = pd.DataFrame({"ts": table_full.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table_full.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    mono = monotone_vector(SULFUR_FEATURES, "sulfur_mgkg")
+    samples = np.sort(tbl["_lims_ts"].unique())
+    bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
+    q = tel_go[["242000:Q21"]].dropna().sort_index()
+    qdf = pd.DataFrame({"ts": q.index, "B": q["242000:Q21"].values}).sort_values("ts")
+
+    parts = []
+    for i in range(5):
+        lo_i, hi_i = bounds[i], bounds[i + 1]
+        cut_lo, cut_hi = samples[lo_i], samples[hi_i - 1]
+        tr = tbl[tbl["_lims_ts"] < cut_lo]
+        te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
+        if len(tr) < 200 or len(te) < 20:
+            continue
+        tr_fit = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]
+        base = tr_fit[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(tr_fit) // 50),
+                               monotone_constraints=mono, random_state=42, verbose=-1)
+        m.fit(tr_fit[SULFUR_FEATURES].rename(columns=safe), tr_fit["y"] - base)
+        base_t = te[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        parts.append(pd.DataFrame({
+            "ts": te.index, "y": te["y"].values,
+            "model": (base_t + m.predict(te[SULFUR_FEATURES].rename(columns=safe))).values,
+            "formula": base_t.values,
+            "q20": te["242000:Q20"].values}))
+
+    d = pd.concat(parts).sort_values("ts")
+    d = pd.merge_asof(d, qdf, on="ts", direction="nearest",
+                       tolerance=pd.Timedelta(minutes=15))
+    lab = d["y"].values > LIMIT
+    print(f"  n={len(d)}, внеспековых={int(lab.sum())} ({100*lab.mean():.1f}%)\n")
+    print(f"  {'источник прогноза':<28}{'AUC':>8}")
+    for name, col in (("наша модель", "model"), ("формула Аррениуса", "formula"),
+                       ("Q20 (сера сырья)", "q20"), ("ПАК Q21 (сера продукта)", "B")):
+        sub = d.dropna(subset=[col])
+        print(f"  {name:<28}{auc(sub[col].values, sub['y'].values > LIMIT):>8.3f}")
+
+    rng = np.random.default_rng(0)
+    y = d["y"].values
+    ideal = [auc(y + rng.normal(0, 1.16, len(y)), lab) for _ in range(200)]
+    print(f"  {'идеальный прибор (потолок)':<28}{np.mean(ideal):>8.3f}")
+
+    # Контроль: не тянут ли AUC вниз экстремальные выбросы (y > 20), которых
+    # модель при обучении не видела (они отфильтрованы как в проде).
+    mild = d[d["y"] <= SULFUR_OUTLIER_THRESHOLD]
+    n_hard = int((d["y"] > SULFUR_OUTLIER_THRESHOLD).sum())
+    print(f"\n  контроль: из {int(lab.sum())} внеспековых {n_hard} -- это y > 20 "
+          f"(модель их при обучении не видела)")
+    print(f"  AUC только на «мягких» случаях 10 < y <= 20 (n={len(mild)}):")
+    for name, col in (("наша модель", "model"), ("Q20 (сера сырья)", "q20"),
+                       ("ПАК Q21 (сера продукта)", "B")):
+        sub = mild.dropna(subset=[col])
+        print(f"    {name:<26}{auc(sub[col].values, sub['y'].values > LIMIT):>8.3f}")
+    print("\n  потолок < 1.0 потому, что сама метка 'ЛИМС > 10' шумная:")
+    print("  sigma_ЛИМС ~ 1.16 (H-K1), а медиана серы 8.6 при лимите 10 --")
+    print("  часть 'внеспековых' событий это шум лаборатории, а не режим.")
+
+
+def _sulfur_samples(table: pd.DataFrame, lims: pd.DataFrame, causal: bool = False):
+    """
+    Привязывает строки таблицы к пробам ЛИМС.
+
+    causal=True оставляет только телеметрию, снятую ДО отбора пробы.
+    Замечание Person 2 (2026-09-22): near_mask в build_sulfur_table берёт
+    окно +-1 час ВОКРУГ пробы, то есть в обучение попадают показания уже
+    ПОСЛЕ момента отбора. Для задачи "оценить серу сейчас" это заглядывание
+    в будущее, и особенно грубое для Q21 -- прибор к этому моменту уже
+    частично измерил то, что лаборатория только повезла анализировать.
+    """
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+    if causal:
+        tbl = tbl[tbl.index <= tbl["_lims_ts"]]
+    return tbl
+
+
+def experiment_19_baseline_dispute(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    Расхождение с замером Person 2 (2026-09-22).
+
+    Она: "константа (медиана до 2025) 2.36, модель без Q21 2.28" -- то есть
+    модель ВЫИГРЫВАЕТ у константы около 4%.
+    Я (эксп.14): модель ПРОИГРЫВАЕТ константе 1.4-4.4%.
+
+    Оба замера могут быть арифметически верны и означать разное. Два
+    подозрения на источник расхождения:
+      1. ОПРЕДЕЛЕНИЕ КОНСТАНТЫ. Медиана минимизирует MAE, среднее -- RMSE.
+         Сравнивать по RMSE с медианой -- давать модели фору.
+      2. ОДИН СПЛИТ ПРОТИВ ПЯТИ. Эксп.12 уже ловил этот капкан: эффект
+         +0.124 на одном разрезе превратился в -0.054 на пяти.
+    Развожу оба фактора явно, на её же протоколе (тест = 2026 год).
+    """
+    print("\n=== Эксперимент 19: чем мерить базу -- медианой или средним ===")
+    import lightgbm as lgb
+    from src.models.base import monotone_vector
+
+    tbl = _sulfur_samples(table, lims)
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    mono = monotone_vector(SULFUR_FEATURES, "sulfur_mgkg")
+
+    def fit_predict(tr, te):
+        tr = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]
+        base = tr[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                               monotone_constraints=mono, random_state=42, verbose=-1)
+        m.fit(tr[SULFUR_FEATURES].rename(columns=safe), tr["y"] - base)
+        base_t = te[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        return (base_t + m.predict(te[SULFUR_FEATURES].rename(columns=safe))).values
+
+    print("\n  -- протокол Person 2: тест = 2026 год, обучение = всё до него --")
+    tr = tbl[tbl["_lims_ts"] < pd.Timestamp("2026-01-01")]
+    te = tbl[tbl["_lims_ts"] >= pd.Timestamp("2026-01-01")]
+    y = te["y"].values
+    trf = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]
+    rmse = lambda p: float(np.sqrt(np.mean((p - y) ** 2)))
+    med, avg = float(trf["y"].median()), float(trf["y"].mean())
+    r_model = rmse(fit_predict(tr, te))
+    r_med, r_avg = rmse(np.full(len(y), med)), rmse(np.full(len(y), avg))
+    print(f"    n_train={len(trf)}, n_test={len(te)}")
+    print(f"    константа = МЕДИАНА трейна ({med:.2f}):  RMSE {r_med:.3f}")
+    print(f"    константа = СРЕДНЕЕ трейна ({avg:.2f}):  RMSE {r_avg:.3f}")
+    print(f"    модель без Q21:                      RMSE {r_model:.3f}")
+    print(f"    skill против медианы: {100*(1-r_model/r_med):+.1f}%   "
+          f"против среднего: {100*(1-r_model/r_avg):+.1f}%")
+
+    print("\n  -- тот же вопрос на 5 разрезах (устойчивость знака) --")
+    samples = np.sort(tbl["_lims_ts"].unique())
+    print(f"    {'разрез':<9}{'n_test':>8}{'медиана':>10}{'среднее':>10}{'модель':>9}"
+          f"{'vs мед.':>9}{'vs сред.':>10}")
+    sk_med, sk_avg = [], []
+    for frac in (0.60, 0.68, 0.76, 0.84, 0.92):
+        cut = samples[int(len(samples) * frac)]
+        tr = tbl[tbl["_lims_ts"] < cut]
+        te = tbl[tbl["_lims_ts"] >= cut]
+        if len(te) < 100:
+            continue
+        y = te["y"].values
+        trf = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]
+        rmse = lambda p: float(np.sqrt(np.mean((p - y) ** 2)))
+        rm, ra, r_mod = (rmse(np.full(len(y), trf["y"].median())),
+                          rmse(np.full(len(y), trf["y"].mean())),
+                          rmse(fit_predict(tr, te)))
+        sk_med.append(100 * (1 - r_mod / rm))
+        sk_avg.append(100 * (1 - r_mod / ra))
+        print(f"    {frac:<9.2f}{len(te):>8}{rm:>10.3f}{ra:>10.3f}{r_mod:>9.3f}"
+              f"{sk_med[-1]:>+8.1f}%{sk_avg[-1]:>+9.1f}%")
+    print(f"\n    средний skill против МЕДИАНЫ: {np.mean(sk_med):+.1f}% "
+          f"(положителен в {sum(1 for x in sk_med if x > 0)}/{len(sk_med)})")
+    print(f"    средний skill против СРЕДНЕГО: {np.mean(sk_avg):+.1f}% "
+          f"(положителен в {sum(1 for x in sk_avg if x > 0)}/{len(sk_avg)})")
+
+
+def experiment_20_q21_causal(table: pd.DataFrame, tel_go: pd.DataFrame, lims: pd.DataFrame):
+    """
+    Проверка, которую запросила Person 2: результат Q21=1.589 получен на
+    окне +-1 час вокруг пробы, то есть с заглядыванием вперёд. Перемерить
+    строго причинно -- только показания ДО момента отбора пробы.
+
+    Дополнительно -- распад информативности по горизонту: Q21, взятый за H
+    часов до пробы. Person 2 замерила корреляцию (0.47 -> -0.03 за 4 часа);
+    здесь то же в единицах RMSE, то есть в том, что реально важно.
+    """
+    print("\n=== Эксперимент 20: Q21 строго до момента отбора пробы ===")
+    q = tel_go[["242000:Q21"]].dropna().sort_index()
+    qdf = pd.DataFrame({"ts": q.index, "B": q["242000:Q21"].values}).sort_values("ts")
+    tbl = _sulfur_samples(table, lims)
+    per = tbl.groupby("_lims_ts").agg(y=("y", "first")).reset_index()
+    per = per.rename(columns={"_lims_ts": "lims_ts"}).sort_values("lims_ts")
+    per = per[per["y"] <= SULFUR_OUTLIER_THRESHOLD]
+
+    print(f"  {'показание Q21':<34}{'n':>6}{'RMSE':>9}{'corr':>8}")
+    for lag_h, label in ((None, "ближайшее в +-15 мин (как было)"),
+                          (0.0, "строго ДО пробы (причинно)"),
+                          (1.0, "за 1 ч до пробы"),
+                          (2.0, "за 2 ч до пробы"),
+                          (4.0, "за 4 ч до пробы"),
+                          (8.0, "за 8 ч до пробы")):
+        left = per.rename(columns={"lims_ts": "ts"}).copy()
+        if lag_h is None:
+            m = pd.merge_asof(left, qdf, on="ts", direction="nearest",
+                               tolerance=pd.Timedelta(minutes=15))
+        else:
+            left["ts"] = left["ts"] - pd.Timedelta(hours=lag_h)
+            m = pd.merge_asof(left, qdf, on="ts", direction="backward",
+                               tolerance=pd.Timedelta(hours=2))
+        m = m.dropna(subset=["B"])
+        m = m[m["B"] <= SULFUR_OUTLIER_THRESHOLD]
+        r = float(np.sqrt(np.mean((m["B"] - m["y"]) ** 2)))
+        print(f"  {label:<34}{len(m):>6}{r:>9.3f}{m['B'].corr(m['y']):>8.3f}")
+    print("\n  (RMSE здесь -- это сам прибор как прогноз, без всякой модели)")
+
+
+def experiment_21_sensitivity_t5(table: pd.DataFrame, tel_go: pd.DataFrame,
+                                  lims: pd.DataFrame):
+    """
+    H-L1 + проверка, которую запросила Person 2.
+
+    Optimizer использует не сам прогноз, а ОТКЛИК на изменение уставки.
+    monotone_constraints гарантируют ЗНАК (не возрастает по T5), но не
+    величину: отклик может быть нулевым, и тогда рычаг мёртвый -- в
+    сценарии "риск качества" агент не найдёт корректирующего действия.
+
+    Person 2 предупредила, что модель С Q21 выучит "сера ~ Q21" и потеряет
+    чувствительность к T5. Проверяем ровно это.
+
+    Возмущение прокидывается по всем производным признакам от T5
+    (arrhenius_t5, q20_x_arrhenius, quench_delta), кроме лагов и скользящих --
+    мгновенное изменение уставки не меняет историю за 3 и 6 часов назад.
+    """
+    print("\n=== Эксперимент 21 (H-L1): отклик прогноза на +2 C по T5 ===")
+    import lightgbm as lgb
+    from src.models.base import monotone_vector
+    from src.models.features import arrhenius_term
+
+    tbl = _sulfur_samples(table, lims)
+    q = tel_go[["242000:Q21"]].dropna().sort_index()
+    qdf = pd.DataFrame({"ts": q.index, "B": q["242000:Q21"].values}).sort_values("ts")
+    tbl = pd.merge_asof(tbl.rename_axis("ts").reset_index().sort_values("ts"),
+                         qdf, on="ts", direction="backward",
+                         tolerance=pd.Timedelta(hours=1)).dropna(subset=["B"]).set_index("ts")
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    cut = samples[int(len(samples) * 0.8)]
+    tr = tbl[(tbl["_lims_ts"] < cut) & (tbl["y"] <= SULFUR_OUTLIER_THRESHOLD)]
+    te = tbl[tbl["_lims_ts"] >= cut]
+
+    def perturb(X, delta):
+        Z = X.copy()
+        t6 = X["242000:T5"] - X["242000:T5_T6_quench_delta"]
+        Z["242000:T5"] = X["242000:T5"] + delta
+        Z["242000:arrhenius_t5"] = arrhenius_term(Z["242000:T5"])
+        Z["242000:q20_x_arrhenius"] = Z["242000:Q20"] * Z["242000:arrhenius_t5"]
+        Z["242000:T5_T6_quench_delta"] = Z["242000:T5"] - t6
+        return Z
+
+    for label, feats in (("без Q21 (модель эффекта)", list(SULFUR_FEATURES)),
+                          ("с Q21 (модель уровня)", list(SULFUR_FEATURES) + ["B"])):
+        safe = {c: c.replace(":", "__") for c in feats}
+        mono = monotone_vector(SULFUR_FEATURES, "sulfur_mgkg") + ([0] if "B" in feats else [])
+        base = tr[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                               monotone_constraints=mono, random_state=42, verbose=-1)
+        m.fit(tr[feats].rename(columns=safe), tr["y"] - base)
+
+        def predict(X):
+            b = X[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+            return b.values + m.predict(X[feats].rename(columns=safe))
+
+        te2 = perturb(te, +2.0)
+        p0, p2 = predict(te), predict(te2)
+        d = p2 - p0
+        rmse = float(np.sqrt(np.mean((p0 - te["y"].values) ** 2)))
+        b0 = te[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1).values
+        b2 = te2[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1).values
+        print(f"\n  --- {label} ---   RMSE={rmse:.3f}")
+        print(f"    отклик на +2 C: медиана {np.median(d):+.3f} мг/кг, "
+              f"среднее {d.mean():+.3f}, "
+              f"разброс [{np.percentile(d,5):+.3f}, {np.percentile(d,95):+.3f}]")
+        print(f"      из них от формулы: {np.median(b2-b0):+.3f}, "
+              f"от ML-остатка: {np.median(d - (b2-b0)):+.3f}")
+        print(f"    доля точек с нулевым откликом (|d| < 0.01): "
+              f"{100*np.mean(np.abs(d) < 0.01):.1f}%")
+    print("\n  Ожидание по кинетике (Ea=55 кДж/моль): единицы десятых мг/кг на 2 C.")
+    print("  Нулевой отклик = мёртвый рычаг: Optimizer не найдёт корректирующего действия.")
+
+
+def experiment_22_sign_leak(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    Эксп.21 показал, что отклик прогноза на +2 C по T5 ПОЛОЖИТЕЛЬНЫЙ
+    (+0.197 мг/кг), хотя физика требует отрицательного: выше температура ->
+    глубже HDS -> меньше серы. И это при включённом monotone-ограничении
+    EXPECTED_SIGNS["sulfur_mgkg"]["242000:T5"] = -1.
+
+    Гипотеза о механизме: ограничение обходится через ПРОИЗВОДНЫЕ от T5
+    признаки, у которых знака не задано вовсе --
+        242000:arrhenius_t5     = exp(-Ea/RT), растёт с T
+        242000:q20_x_arrhenius  = Q20 * arrhenius_t5
+        242000:T5_T6_quench_delta = T5 - T6
+    LightGBM ограничивает монотонность ПОКОЛОНОЧНО. Запретив рост по
+    колонке T5, мы ничего не запретили по колонке arrhenius_t5, которая
+    является строго возрастающей функцией той же T5. Дверь заперта,
+    окно открыто.
+
+    Это ровно тот риск, о котором предупреждает комментарий в go.py
+    ("модель может выучить контур регулирования и перепутать знак у
+    температуры реактора") -- он реализовался, просто в обход.
+
+    Проверяем механизм и лечение. Знак для arrhenius_t5 физически
+    однозначен: больше arrhenius -> глубже обессеривание -> МЕНЬШЕ серы,
+    то есть -1. Для q20_x_arrhenius знак неоднозначен (произведение
+    растущего и убывающего вкладов), поэтому вариант с его удалением.
+    """
+    print("\n=== Эксперимент 22: обход monotone через производные от T5 ===")
+    import lightgbm as lgb
+    from src.models.base import EXPECTED_SIGNS
+    from src.models.features import arrhenius_term
+
+    tbl = _sulfur_samples(table, lims)
+    samples = np.sort(tbl["_lims_ts"].unique())
+    base_signs = dict(EXPECTED_SIGNS["sulfur_mgkg"])
+
+    def perturb(X, delta):
+        Z = X.copy()
+        t6 = X["242000:T5"] - X["242000:T5_T6_quench_delta"]
+        Z["242000:T5"] = X["242000:T5"] + delta
+        Z["242000:arrhenius_t5"] = arrhenius_term(Z["242000:T5"])
+        Z["242000:q20_x_arrhenius"] = Z["242000:Q20"] * Z["242000:arrhenius_t5"]
+        Z["242000:T5_T6_quench_delta"] = Z["242000:T5"] - t6
+        return Z
+
+    variants = [
+        ("как сейчас", list(SULFUR_FEATURES), {}),
+        ("+ arrhenius_t5 = -1", list(SULFUR_FEATURES), {"242000:arrhenius_t5": -1}),
+        ("+ arrh=-1, без q20_x_arrh",
+         [c for c in SULFUR_FEATURES if c != "242000:q20_x_arrhenius"],
+         {"242000:arrhenius_t5": -1}),
+        ("без обоих arrhenius-фич",
+         [c for c in SULFUR_FEATURES
+          if c not in ("242000:arrhenius_t5", "242000:q20_x_arrhenius")], {}),
+    ]
+
+    print(f"  {'вариант':<28}{'RMSE':>8}{'отклик +2C':>13}{'доля >0':>10}{'блоков':>8}")
+    for label, feats, extra in variants:
+        signs = {**base_signs, **extra}
+        mono = [signs.get(c, 0) for c in feats]
+        safe = {c: c.replace(":", "__") for c in feats}
+        rmses, meds, wrong = [], [], []
+        for frac in (0.60, 0.72, 0.84):
+            cut = samples[int(len(samples) * frac)]
+            tr = tbl[(tbl["_lims_ts"] < cut) & (tbl["y"] <= SULFUR_OUTLIER_THRESHOLD)]
+            te = tbl[tbl["_lims_ts"] >= cut]
+            if len(te) < 100:
+                continue
+            b = tr[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+            m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                   num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                                   monotone_constraints=mono, random_state=42, verbose=-1)
+            m.fit(tr[feats].rename(columns=safe), tr["y"] - b)
+
+            def pred(X):
+                bb = X[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+                return bb.values + m.predict(X[feats].rename(columns=safe))
+
+            p0, p2 = pred(te), pred(perturb(te, +2.0))
+            rmses.append(float(np.sqrt(np.mean((p0 - te["y"].values) ** 2))))
+            meds.append(float(np.median(p2 - p0)))
+            wrong.append(float(np.mean((p2 - p0) > 0)))
+        print(f"  {label:<28}{np.mean(rmses):>8.3f}{np.mean(meds):>+13.3f}"
+              f"{100*np.mean(wrong):>9.1f}%{len(rmses):>8}")
+
+    print("\n  физика: выше T -> глубже HDS -> МЕНЬШЕ серы, отклик должен быть < 0.")
+    print("  'доля >0' -- сколько точек модель считает, что нагрев ПОВЫШАЕТ серу.")
+
+
 def main():
     print("Загрузка данных и артефактов...")
     tel_avt_raw = load_telemetry("AVT")
