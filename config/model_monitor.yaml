@@ -1,0 +1,14 @@
+# Агент самоконтроля.
+
+target_coverage: 0.90      # как q90 в sulfur_anchor
+step: 0.2                  # скорость подстройки масштаба
+scale_min: 0.8
+scale_max: 3.0
+
+window: 30                 # анализов в окне статуса
+min_obs: 10                # до этого статус ok
+degraded_below: 0.80
+degraded_scale: 2.0         # интервал расширен сильнее: деградация
+failed_below: 0.65         # ниже: отказ от рекомендаций
+
+match_max_lag_min: 60      # прогноз не старше часа до пробы
