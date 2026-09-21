@@ -6,3 +6,4 @@ data/*.csv
 data/*.xlsx
 .venv/
 .env
+.idea/

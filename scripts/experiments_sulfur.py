@@ -532,6 +532,211 @@ def experiment_9_log_target(table: pd.DataFrame, lims: pd.DataFrame):
              np.exp(lpred_te), np.exp(lpred_te - lq_lo), np.exp(lpred_te + lq_hi))
 
 
+def experiment_10_remaining_features(table: pd.DataFrame, tel_go: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-G1/G3/G4/G5 одним прогоном -- все четыре одной формы («добавить
+    признак, измерить»), поэтому смысла в четырёх отдельных циклах
+    переобучения нет. Каждый кандидат добавляется К ТЕКУЩЕМУ набору,
+    оценка на честном holdout со сплитом по пробам.
+
+      G1: arrhenius_t5 x h2_oil_ratio -- кинетика требует ПРОИЗВЕДЕНИЯ
+          членов (exp(-Ea/RT) x P_H2^m), а мы дали их по отдельности
+      G3: T11 - T6 -- экзотерма второго слоя, пропорциональна тому,
+          сколько серы осталось после первого
+      G4: F9 -- расход сырья отдельно (сейчас он только знаменатель
+          в h2_oil_ratio; сам по себе это время пребывания в реакторе)
+      G5: лаги 3/6ч для h2_oil_ratio и quench_delta (T5 и Q20 их имеют)
+    """
+    print("\n=== Эксперимент 10 (H-G1/G3/G4/G5): оставшиеся признаки ===")
+    import lightgbm as lgb
+
+    extra = tel_go[["242000:T11", "242000:T6", "242000:F9"]].copy()
+    extra["242000:bed2_exotherm"] = extra["242000:T11"] - extra["242000:T6"]
+    cand_cols = {
+        "G1 arrhenius x h2_ratio": ["242000:arr_x_h2"],
+        "G3 экзотерма 2-го слоя":  ["242000:bed2_exotherm"],
+        "G4 расход сырья F9":      ["242000:F9"],
+        "G5 лаги h2/quench":       ["242000:h2_oil_ratio__lag3h", "242000:h2_oil_ratio__lag6h",
+                                     "242000:T5_T6_quench_delta__lag3h",
+                                     "242000:T5_T6_quench_delta__lag6h"],
+    }
+
+    tbl = table.join(extra[["242000:bed2_exotherm", "242000:F9"]], how="left")
+    tbl["242000:arr_x_h2"] = tbl["242000:arrhenius_t5"] * tbl["242000:h2_oil_ratio"]
+    lagged = add_lags(tbl[["242000:h2_oil_ratio", "242000:T5_T6_quench_delta"]],
+                      ["242000:h2_oil_ratio", "242000:T5_T6_quench_delta"], lags_h=(3, 6))
+    tbl = tbl.join(lagged[[c for c in lagged.columns if "__lag" in c]], how="left")
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": tbl.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = tbl.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    s_cut = samples[int(len(samples) * 0.85)]
+    dev, te = tbl[tbl["_lims_ts"] < s_cut], tbl[tbl["_lims_ts"] >= s_cut]
+
+    def run(cols, label):
+        feats = list(SULFUR_FEATURES) + cols
+        d = dev.dropna(subset=feats)
+        t = te.dropna(subset=feats)
+        if len(t) < 50:
+            print(f"  {label:<26} мало точек после dropna ({len(t)}) -- пропуск")
+            return
+        safe = {c: c.replace(":", "__") for c in feats}
+        base_d = d[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(d) // 50),
+                               random_state=42, verbose=-1)
+        m.fit(d[feats].rename(columns=safe), d["y"] - base_d)
+        base_t = t[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + m.predict(t[feats].rename(columns=safe))
+        rmse = float(np.sqrt(((pred - t["y"]) ** 2).mean()))
+        gains = m.booster_.feature_importance(importance_type="gain")
+        share = {c: 100 * g / max(gains.sum(), 1) for c, g in zip(feats, gains)}
+        add = "  ".join(f"{c.split(':')[-1]}={share[c]:.1f}%" for c in cols)
+        print(f"  {label:<26} n_test={len(t):<5} RMSE={rmse:.3f}   {add}")
+
+    run([], "БАЗА (как сейчас)")
+    for label, cols in cand_cols.items():
+        run(cols, label)
+
+
+def experiment_11_q21_go_no_go(table: pd.DataFrame, tel_go: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-B1, дешёвый go/no-go ПЕРЕД тем как строить предобучение/multi-task.
+
+    Идея H-B1: ЛИМС даёт всего ~1444 меток, а Q21 (ПАК серы продукта) --
+    189k точек. Соблазнительно предобучиться на Q21. Риск: Q21 отличается
+    от ЛИМС ровно на ту величину, которую мы считаем потолком (корреляция
+    0.18-0.31), плюс у ПАК известны залипания до 47 суток.
+
+    Проверка одним замером: обучить модель ТОЛЬКО на метках Q21 и оценить
+    её на ЛИМС-holdout. Если RMSE сильно хуже текущих ~2.3 -- переносимого
+    сигнала в Q21 нет, предобучение не поможет, дальше не тратимся.
+    """
+    print("\n=== Эксперимент 11 (H-B1 go/no-go): учить на Q21, проверять на ЛИМС ===")
+    import lightgbm as lgb
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    s_cut = samples[int(len(samples) * 0.85)]
+    dev_lims = tbl[tbl["_lims_ts"] < s_cut]
+    te = tbl[tbl["_lims_ts"] >= s_cut]           # ЛИМС-holdout, общий для обоих
+    te_start = te.index.min()
+
+    # Q21 как метка: берём те же признаки, но y = показание ПАК, и СТРОГО
+    # раньше начала ЛИМС-holdout, иначе сравнение нечестное
+    q21 = tel_go[["242000:Q21"]].dropna()
+    q_tbl = table.join(q21, how="inner")
+    q_tbl = q_tbl[(q_tbl.index < te_start) & (q_tbl["242000:Q21"] <= SULFUR_OUTLIER_THRESHOLD)]
+    print(f"  меток ЛИМС в dev={dev_lims['_lims_ts'].nunique()} проб / {len(dev_lims)} строк")
+    print(f"  меток Q21 в dev={len(q_tbl)} строк  (в {len(q_tbl)//max(len(dev_lims),1)}x больше)")
+    print(f"  общий ЛИМС-holdout={len(te)} строк")
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+
+    def fit_eval(X, y, label, n_for_mcs):
+        base = X[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, n_for_mcs // 50),
+                               random_state=42, verbose=-1)
+        m.fit(X[SULFUR_FEATURES].rename(columns=safe), y - base)
+        base_t = te[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + m.predict(te[SULFUR_FEATURES].rename(columns=safe))
+        rmse = float(np.sqrt(((pred - te["y"]) ** 2).mean()))
+        print(f"  {label:<38} RMSE на ЛИМС-holdout = {rmse:.3f}")
+        return rmse
+
+    r_lims = fit_eval(dev_lims, dev_lims["y"], "обучена на ЛИМС (как сейчас)", len(dev_lims))
+    r_q21 = fit_eval(q_tbl, q_tbl["242000:Q21"], "обучена ТОЛЬКО на Q21", len(q_tbl))
+
+    print()
+    if r_q21 <= r_lims * 1.15:
+        print("  => GO: в Q21 есть переносимый сигнал, предобучение имеет смысл проверять")
+    else:
+        print(f"  => NO-GO: Q21-модель хуже на {100*(r_q21/r_lims-1):.0f}%, переносимого сигнала нет,")
+        print("     предобучение на Q21 не окупится -- закрываем H-B1 без дорогой машинерии")
+
+
+def experiment_12_q21_multisplit(table: pd.DataFrame, tel_go: pd.DataFrame, lims: pd.DataFrame):
+    """
+    Проверка находки эксперимента 11 на НЕСКОЛЬКИХ сплитах.
+
+    В эксп.11 модель на метках ПАК (Q21) предсказала ЛИМС лучше, чем
+    модель на метках ЛИМС (2.175 против 2.299). Разница 0.124 на ОДНОМ
+    сплите -- после урока H-B3 такому не верим. Здесь walk-forward: пять
+    точек разреза по времени, в каждой обе модели учатся на одном периоде
+    и проверяются на одном тесте. Смотрим не величину, а УСТОЙЧИВОСТЬ
+    знака разницы.
+    """
+    print("\n=== Эксперимент 12: метки ЛИМС против меток Q21 на 5 сплитах ===")
+    import lightgbm as lgb
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    q21 = tel_go[["242000:Q21"]].dropna()
+    tbl_q = tbl.join(q21, how="inner")
+    tbl_q = tbl_q[tbl_q["242000:Q21"] <= SULFUR_OUTLIER_THRESHOLD]
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    samples = np.sort(tbl["_lims_ts"].unique())
+
+    def fit_eval(X, y, test):
+        base = X[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(X) // 50),
+                               random_state=42, verbose=-1)
+        m.fit(X[SULFUR_FEATURES].rename(columns=safe), y - base)
+        base_t = test[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + m.predict(test[SULFUR_FEATURES].rename(columns=safe))
+        return float(np.sqrt(((pred - test["y"]) ** 2).mean()))
+
+    print(f"  {'разрез':<10}{'n_test':>8}{'ЛИМС-метки':>13}{'Q21-метки':>12}{'разница':>10}")
+    diffs = []
+    for frac in (0.60, 0.68, 0.76, 0.84, 0.92):
+        cut = samples[int(len(samples) * frac)]
+        dev_l = tbl[tbl["_lims_ts"] < cut]
+        te = tbl[tbl["_lims_ts"] >= cut]
+        dev_q = tbl_q[tbl_q.index < te.index.min()]
+        if len(te) < 100 or len(dev_q) < 200:
+            continue
+        r_l = fit_eval(dev_l, dev_l["y"], te)
+        r_q = fit_eval(dev_q, dev_q["242000:Q21"], te)
+        diffs.append(r_q - r_l)
+        print(f"  {frac:<10.2f}{len(te):>8}{r_l:>13.3f}{r_q:>12.3f}{r_q - r_l:>+10.3f}")
+
+    d = np.array(diffs)
+    print()
+    print(f"  разница Q21-ЛИМС по сплитам: среднее {d.mean():+.3f}, "
+          f"медиана {np.median(d):+.3f}, отрицательна в {int((d < 0).sum())} из {len(d)}")
+    if (d < 0).all():
+        print("  => эффект УСТОЙЧИВ: метки Q21 лучше на всех сплитах")
+    elif (d < 0).sum() >= len(d) - 1:
+        print("  => эффект скорее есть, но не на всех сплитах -- нужна осторожность")
+    else:
+        print("  => эффект НЕ устойчив: находка эксп.11 была особенностью одного сплита")
+
+
 def main():
     print("Загрузка данных и артефактов...")
     tel_avt_raw = load_telemetry("AVT")
@@ -559,6 +764,9 @@ def main():
     experiment_7_effective_sample_size(table, lims)
     experiment_8_normalized_conformal(table, lims)
     experiment_9_log_target(table, lims)
+    experiment_10_remaining_features(table, tel_go, lims)
+    experiment_11_q21_go_no_go(table, tel_go, lims)
+    experiment_12_q21_multisplit(table, tel_go, lims)
 
     print("\nПересборка таблицы БЕЗ отсечения выбросов (для H-B2)...")
     table_full, _ = build_sulfur_table(avt, tel_avt_raw, tel_go, lims,
