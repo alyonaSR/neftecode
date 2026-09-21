@@ -166,6 +166,37 @@ def test_derived_features_are_computed_from_raw_tags():
     GOModel.derive_features({"242000:T5": 370.0})
 
 
+def test_no_formula_plus_trained_residual_does_not_double_count_level():
+    """
+    Регрессия (2026-09-22). При formula_fn=None остаток обучается на
+    y - 0 = y, то есть САМ несёт уровень. predict_one подставлял сверх
+    этого ещё и fallback_mean -- уровень считался дважды.
+
+    Замер до исправления (feed_ebp_c, обученный без формулы): прогноз
+    ~730 при метке ~365, RMSE 364.6. В продакшен-артефакте баг был
+    спящим: у единственной цели с formula_fn=None (feed_flash_c) остаток
+    не обучен, поэтому срабатывал путь fallback и всё было верно.
+    Тест закрывает оба пути -- и обученный, и необученный.
+    """
+    import numpy as np
+    import pandas as pd
+    from src.models.formula_residual import FormulaPlusResidual
+
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("2026-01-01", periods=400, freq="1h")
+    X = pd.DataFrame({"a": rng.normal(10, 2, 400), "b": rng.normal(5, 1, 400)}, index=idx)
+    y = pd.Series(365.0 + 0.5 * X["a"].values + rng.normal(0, 1, 400), index=idx)
+
+    m = FormulaPlusResidual(name="t", formula_fn=None, formula_tags=[],
+                            feature_cols=["a", "b"], fallback_mean=365.0)
+    # без обучения -- работает опорная константа, а не 0.0
+    assert m.predict_one({"a": 10.0, "b": 5.0}).mean == 365.0
+
+    m.fit(X, y)
+    pred = m.predict_one({"a": 10.0, "b": 5.0}).mean
+    assert 340.0 < pred < 390.0, f"уровень посчитан дважды: {pred:.1f} вместо ~370"
+
+
 def test_missing_features_are_reported_not_raised():
     m = GOModel()
     assert "242000:T5" in m.check_features({"catalyst_age_days": 500.0})
