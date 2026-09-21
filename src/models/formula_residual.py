@@ -75,6 +75,8 @@ class FormulaPlusResidual:
         self._model = None
         self._conformal: Optional[ConformalResidualBounds] = None
         self._resid_bias = 0.0  # медиана остатка на калибровке, см. fit()
+        self._sigma_model = None  # H-I1: предсказывает |остаток| -> условная ширина
+        self._sigma_floor = 1.0   # пол для sigma, чтобы не делить на ~0
         self._n_train = 0
         self._n_calib = 0
 
@@ -92,6 +94,39 @@ class FormulaPlusResidual:
             # входа формулы не хватает (деградированное состояние) --
             # вырождается в чистый residual, не падает
             return 0.0
+
+    # ------------------------------------------------------------------
+    def _fit_sigma(self, X_train: pd.DataFrame, resid_train, params: dict):
+        """
+        H-I1. Модель величины ошибки sigma(x) = E[|остаток|]. Намеренно
+        МЕНЬШЕ основной (глубина 3, 100 деревьев): её задача -- грубо
+        отличить спокойный режим от турбулентного, а не выучить шум.
+        Переобученная sigma сделала бы интервал случайным, а не условным.
+        """
+        p = dict(params)
+        p.update(n_estimators=100, max_depth=3, num_leaves=7,
+                 min_child_samples=max(5, len(X_train) // 30))
+        p.pop("monotone_constraints", None)  # знаки заданы для уровня, не для |ошибки|
+        m = lgb.LGBMRegressor(**p)
+        m.fit(X_train[self.feature_cols].rename(columns=_safe_name), np.abs(resid_train))
+        # пол = 20% от типичной sigma на обучении: защищает от деления на ~0
+        # и от абсурдно узкого интервала там, где sigma-модель ошиблась вниз
+        pred = m.predict(X_train[self.feature_cols].rename(columns=_safe_name))
+        self._sigma_floor = max(1e-6, 0.2 * float(np.median(np.abs(pred))))
+        return m
+
+    def _sigma_of(self, X: pd.DataFrame):
+        """sigma(x) для набора строк. Без sigma-модели -- единицы (глобальный режим)."""
+        if self._sigma_model is None:
+            return np.ones(len(X))
+        s = self._sigma_model.predict(X[self.feature_cols].rename(columns=_safe_name))
+        return np.clip(s, self._sigma_floor, None)
+
+    def _sigma_one(self, row: pd.DataFrame) -> float:
+        if self._sigma_model is None:
+            return 1.0
+        s = float(self._sigma_model.predict(row.rename(columns=_safe_name))[0])
+        return max(s, self._sigma_floor)
 
     # ------------------------------------------------------------------
     def fit(self, X: pd.DataFrame, y: pd.Series, train_frac: float = 0.8,
@@ -153,18 +188,35 @@ class FormulaPlusResidual:
             self._resid_bias = float(np.median(err))
             err_debiased = err - self._resid_bias
 
+            # H-I1 (SULFUR_HYPOTHESES.md, проверено experiment_8): УСЛОВНЫЙ
+            # конформный интервал. Раньше квантиль остатка был один глобальный
+            # на все режимы -- интервал одинаково широкий и в спокойный день,
+            # и в турбулентный, то есть в спокойном мы отдавали запас впустую
+            # (а Gate проверяет именно верхнюю границу). Теперь вторая модель
+            # учится предсказывать ВЕЛИЧИНУ ошибки sigma(x), остаток нормируется
+            # на неё, а интервал восстанавливается как pred +- q*sigma(x).
+            # Маргинальное покрытие сохраняется (стандартный результат для
+            # normalized conformal), но ширина становится условной.
+            # Замер на честном holdout: ширина 3.09 в спокойных режимах против
+            # 4.94 в турбулентных (было 3.89 везде), запас до лимита 10 мг/кг
+            # в спокойных вырос на +0.48.
+            self._sigma_model = self._fit_sigma(X_train, resid_train, params)
+            sigma_calib = self._sigma_of(X_calib)
+
             # Stage 3: split conformal + ACI вместо наивных np.quantile.
-            # Калибруется на ДЕ-СМЕЩЁННОМ остатке, чтобы интервал был
-            # честной оценкой оставшейся неопределённости вокруг уже
-            # скорректированного центра, а не заодно тащил на себе
+            # Калибруется на ДЕ-СМЕЩЁННОМ и НОРМИРОВАННОМ остатке, чтобы
+            # интервал был честной оценкой оставшейся неопределённости вокруг
+            # уже скорректированного центра, а не тащил на себе ещё и
             # исправление смещения.
-            self._conformal = ConformalResidualBounds().fit(err_debiased)
+            self._conformal = ConformalResidualBounds().fit(err_debiased / sigma_calib)
             self._n_calib = len(X_calib)
         else:
             # мало данных на калибровку -- эвристический запас,
             # честно шире, чем typical residual std
             spread = float(resid_train.std()) if len(resid_train) > 1 else 1.0
             self._resid_bias = 0.0
+            self._sigma_model = None  # мало данных -- без условной ширины
+            self._sigma_floor = 1.0
             self._conformal = ConformalResidualBounds().fit(
                 np.array([-1.5 * spread, 1.5 * spread])
             )
@@ -201,7 +253,13 @@ class FormulaPlusResidual:
             offset_lo, offset_hi = self._conformal.bounds()
         else:
             offset_lo, offset_hi = -1.0, 1.0
-        lo, hi = mean + offset_lo, mean + offset_hi
+        # H-I1: offsets откалиброваны на НОРМИРОВАННОМ остатке, поэтому
+        # разворачиваем обратно через sigma(x) этой конкретной строки --
+        # интервал получается узким в спокойном режиме и широким в
+        # турбулентном. Без sigma-модели (старый артефакт, мало данных)
+        # sigma=1 и поведение ровно прежнее, глобальное.
+        sigma = self._sigma_one(row)
+        lo, hi = mean + offset_lo * sigma, mean + offset_hi * sigma
         if lo > hi:
             lo, hi = hi, lo
         return Interval(mean, lo, hi)
@@ -223,7 +281,9 @@ class FormulaPlusResidual:
         safe_row = row[self.feature_cols].rename(columns=_safe_name)
         resid = float(self._model.predict(safe_row)[0])
         pred = self.baseline(features) + resid + self._resid_bias
-        self._conformal.update(y_true - pred)
+        # H-I1: конформ откалиброван на нормированном остатке, значит и
+        # онлайн-обновление ACI должно приходить в том же масштабе
+        self._conformal.update((y_true - pred) / self._sigma_one(row))
 
     # ------------------------------------------------------------------
     def to_state(self) -> dict:
@@ -231,6 +291,8 @@ class FormulaPlusResidual:
             "name": self.name, "model": self._model,
             "conformal": self._conformal.to_state() if self._conformal else None,
             "resid_bias": self._resid_bias,
+            "sigma_model": self._sigma_model,   # H-I1, условная ширина интервала
+            "sigma_floor": self._sigma_floor,
             "n_train": self._n_train, "n_calib": self._n_calib,
             "fallback_mean": self.fallback_mean,
         }
@@ -264,6 +326,11 @@ class FormulaPlusResidual:
             legacy._lo_scores = [-state["resid_lo"]]
             obj._conformal = legacy
         obj._resid_bias = state.get("resid_bias", 0.0)
+        # H-I1: в артефактах, сохранённых ДО условного конформа, sigma-модели
+        # нет -- тогда _sigma_of/_sigma_one вернут 1.0 и интервал останется
+        # глобальным, ровно как раньше. Обратная совместимость без ветвлений.
+        obj._sigma_model = state.get("sigma_model")
+        obj._sigma_floor = state.get("sigma_floor", 1.0)
         obj._n_train = state.get("n_train", 0)
         obj._n_calib = state.get("n_calib", 0)
         obj.fallback_mean = state.get("fallback_mean", fallback_mean)

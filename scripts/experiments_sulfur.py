@@ -65,10 +65,15 @@ def as_of_target(X: pd.DataFrame, lims: pd.DataFrame, param: str, tol_h: float =
     return merged.set_index("ts")
 
 
-def build_sulfur_table(avt_model: AVTModel, tel_avt_raw, tel_go, lims, feed_delay_h: float = 0.0):
+def build_sulfur_table(avt_model: AVTModel, tel_avt_raw, tel_go, lims,
+                        feed_delay_h: float = 0.0, drop_outliers: bool = True):
     """
     Та же сборка, что train_go.py, но с опциональным сдвигом feed_ebp_c/
     feed_d15_kgm3 на feed_delay_h назад по времени (эксперимент 3).
+
+    drop_outliers=False оставляет точки с y > SULFUR_OUTLIER_THRESHOLD
+    в таблице -- нужно эксперименту 6 (H-B2), который проверяет, не лучше
+    ли их взвешивать, а не выбрасывать.
     """
     t5 = tel_go[["242000:T5", "242000:T6", "242000:Q20", "242000:F25", "242000:F9"]].dropna()
     t5["242000:T5_T6_quench_delta"] = t5["242000:T5"] - t5["242000:T6"]
@@ -105,7 +110,8 @@ def build_sulfur_table(avt_model: AVTModel, tel_avt_raw, tel_go, lims, feed_dela
 
     table = as_of_target(X_sulfur, lims, "sulfur_mgkg")
     before_n = len(table)
-    table = table[table["y"] <= SULFUR_OUTLIER_THRESHOLD]
+    if drop_outliers:
+        table = table[table["y"] <= SULFUR_OUTLIER_THRESHOLD]
     return table, before_n - len(table)
 
 
@@ -244,6 +250,288 @@ def experiment_5_true_holdout_test(table: pd.DataFrame):
     print(f"  Разрыв test-calib = {gap:+.3f} ({'подозрительно' if gap > 0.5 else 'в пределах шума'})")
 
 
+def experiment_6_outlier_weighting(table_full: pd.DataFrame):
+    """
+    H-B2. Сейчас 59 точек с y > 20 мг/кг просто выбрасываются из обучения.
+    Гипотеза: их лучше оставить с пониженным весом -- это реальные
+    аварийные режимы, модель могла бы о них что-то узнать, не заражаясь.
+
+    Сравнение честное: оба варианта обучаются на одном и том же train-куске
+    (первые 85% по времени) и оцениваются на одном и том же TEST (последние
+    15%), причём TEST-метрика считается только по нормальным точкам
+    (y <= 20) -- чтобы сравнивать способность предсказывать штатный режим,
+    а не то, кто удачнее угадал единичную аварию.
+    """
+    print("\n=== Эксперимент 6 (H-B2): выбрасывать выбросы или взвешивать ===")
+    import lightgbm as lgb
+
+    n = len(table_full)
+    cut = int(n * 0.85)
+    dev, test = table_full.iloc[:cut], table_full.iloc[cut:]
+    test_norm = test[test["y"] <= SULFUR_OUTLIER_THRESHOLD]
+    n_out_dev = int((dev["y"] > SULFUR_OUTLIER_THRESHOLD).sum())
+    print(f"  dev={len(dev)} (из них выбросов {n_out_dev})  TEST(норм. точки)={len(test_norm)}")
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+
+    def fit_eval(dev_part, weights, label):
+        base = dev_part[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        resid = dev_part["y"] - base
+        model = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                   num_leaves=15, min_child_samples=max(5, len(dev_part) // 50),
+                                   random_state=42, verbose=-1)
+        model.fit(dev_part[SULFUR_FEATURES].rename(columns=safe), resid, sample_weight=weights)
+
+        base_t = test_norm[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + model.predict(test_norm[SULFUR_FEATURES].rename(columns=safe))
+        rmse = float(np.sqrt(((pred - test_norm["y"]) ** 2).mean()))
+        print(f"  {label}: RMSE на TEST = {rmse:.3f}")
+        return rmse
+
+    dev_dropped = dev[dev["y"] <= SULFUR_OUTLIER_THRESHOLD]
+    rmse_drop = fit_eval(dev_dropped, None, "ВЫБРОСИТЬ (как сейчас)   ")
+
+    for w in (0.1, 0.3):
+        weights = np.where(dev["y"] > SULFUR_OUTLIER_THRESHOLD, w, 1.0)
+        fit_eval(dev, weights, f"ВЗВЕСИТЬ (вес выброса {w})")
+
+    return rmse_drop
+
+
+def experiment_7_effective_sample_size(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-H1. В таблице 10056 строк, но различных ЛИМС-проб всего 1444: окно
+    near_mask (±1ч при шаге 10 мин) даёт РОВНО 7 телеметрических строк на
+    одну лабораторную пробу, и все 7 получают одну метку. Значит:
+      - эффективная выборка в 7 раз меньше, чем «видит» модель;
+      - min_child_samples = n//50 = 201 -- это ~29 независимых наблюдений
+        на лист, а не 201.
+
+    Сравниваем три варианта на одном честном holdout, причём СПЛИТ ДЕЛАЕМ
+    ПО ПРОБАМ, а не по строкам -- иначе одна проба может попасть и в train,
+    и в test своими разными строками.
+    """
+    print("\n=== Эксперимент 7 (H-H1): честный эффективный размер выборки ===")
+    import lightgbm as lgb
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    cut_s = samples[int(len(samples) * 0.85)]
+    dev = tbl[tbl["_lims_ts"] < cut_s]
+    test = tbl[tbl["_lims_ts"] >= cut_s]
+    print(f"  проб всего={len(samples)}  dev={dev['_lims_ts'].nunique()} проб / {len(dev)} строк"
+          f"  TEST={test['_lims_ts'].nunique()} проб / {len(test)} строк")
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+
+    def fit_eval(dev_part, mcs, label):
+        base = dev_part[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        model = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                   num_leaves=15, min_child_samples=mcs,
+                                   random_state=42, verbose=-1)
+        model.fit(dev_part[SULFUR_FEATURES].rename(columns=safe), dev_part["y"] - base)
+        base_t = test[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + model.predict(test[SULFUR_FEATURES].rename(columns=safe))
+        rmse = float(np.sqrt(((pred - test["y"]) ** 2).mean()))
+        print(f"  {label:<46} mcs={mcs:<5} RMSE на TEST = {rmse:.3f}")
+        return rmse
+
+    fit_eval(dev, max(5, len(dev) // 50), "A: как сейчас (все строки)")
+
+    dedup = dev.sort_index().groupby("_lims_ts", as_index=False).first()
+    dedup.index = range(len(dedup))
+    fit_eval(dedup, max(5, len(dedup) // 50), "B: дедупликация (1 строка на пробу)")
+
+    for mult in (3, 7):
+        fit_eval(dev, max(5, (len(dev) // 50) * mult),
+                 f"C: все строки, mcs x{mult} (поправка на дубли)")
+
+
+def experiment_8_normalized_conformal(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-I1. Сейчас конформный квантиль ОДИН глобальный на все режимы, поэтому
+    интервал одинаково широкий и в спокойный день, и в турбулентный. Gate
+    проверяет верхнюю границу -- значит в спокойном режиме мы отдаём запас
+    впустую.
+
+    Нормализованный конформный: обучаем вторую модель на |остаток| ->
+    sigma(x), считаем score = остаток / sigma(x), квантиль берём от score,
+    а интервал восстанавливаем как pred +- q * sigma(x). Маргинальное
+    покрытие сохраняется (стандартный результат), но ширина становится
+    условной.
+
+    Сплит по ПРОБАМ (как в эксперименте 7), TEST честный.
+    """
+    print("\n=== Эксперимент 8 (H-I1): условный (нормализованный) конформный интервал ===")
+    import lightgbm as lgb
+    from src.models.conformal import finite_sample_quantile
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    s_train = samples[int(len(samples) * 0.70)]
+    s_calib = samples[int(len(samples) * 0.85)]
+    tr = tbl[tbl["_lims_ts"] < s_train]
+    ca = tbl[(tbl["_lims_ts"] >= s_train) & (tbl["_lims_ts"] < s_calib)]
+    te = tbl[tbl["_lims_ts"] >= s_calib]
+    print(f"  train={len(tr)} строк / calib={len(ca)} / TEST={len(te)}")
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+
+    def base_of(df):
+        return df[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+
+    mean_model = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                    num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                                    random_state=42, verbose=-1)
+    mean_model.fit(tr[SULFUR_FEATURES].rename(columns=safe), tr["y"] - base_of(tr))
+
+    def predict_mean(df):
+        return base_of(df) + mean_model.predict(df[SULFUR_FEATURES].rename(columns=safe))
+
+    # sigma-модель на |остаток| обучающей части
+    resid_tr = (tr["y"] - predict_mean(tr)).abs()
+    sigma_model = lgb.LGBMRegressor(n_estimators=100, max_depth=3, learning_rate=0.05,
+                                     num_leaves=7, min_child_samples=max(5, len(tr) // 30),
+                                     random_state=42, verbose=-1)
+    sigma_model.fit(tr[SULFUR_FEATURES].rename(columns=safe), resid_tr)
+
+    def sigma_of(df):
+        s = sigma_model.predict(df[SULFUR_FEATURES].rename(columns=safe))
+        return np.clip(s, 0.2, None)  # пол, чтобы не делить на ~0
+
+    err_ca = (ca["y"] - predict_mean(ca)).values
+    alpha = 0.10
+
+    # (1) глобальный конформный -- как сейчас в проде
+    q_hi_g = finite_sample_quantile(err_ca, alpha)
+    q_lo_g = finite_sample_quantile(-err_ca, alpha)
+
+    # (2) нормализованный
+    s_ca = sigma_of(ca)
+    q_hi_n = finite_sample_quantile(err_ca / s_ca, alpha)
+    q_lo_n = finite_sample_quantile(-err_ca / s_ca, alpha)
+
+    pred_te = predict_mean(te).values
+    y_te = te["y"].values
+    s_te = sigma_of(te)
+
+    def report(label, lo, hi):
+        cov_hi = float(np.mean(y_te <= hi))
+        width = float(np.mean(hi - lo))
+        # спокойные vs турбулентные -- по волатильности T5 за 6ч
+        vol = te["242000:T5__std6h"].values
+        calm = vol <= np.quantile(vol, 0.33)
+        turb = vol >= np.quantile(vol, 0.67)
+        print(f"  {label}")
+        print(f"    покрытие по hi={cov_hi:.3f}  средняя ширина={width:.2f}")
+        print(f"    ширина: спокойные={np.mean((hi-lo)[calm]):.2f}  турбулентные={np.mean((hi-lo)[turb]):.2f}")
+        print(f"    средний ЗАПАС до 10 мг/кг по hi: спокойные={np.mean(10.0-hi[calm]):+.2f}  все={np.mean(10.0-hi):+.2f}")
+
+    report("ГЛОБАЛЬНЫЙ (как в проде)", pred_te - q_lo_g, pred_te + q_hi_g)
+    report("НОРМАЛИЗОВАННЫЙ (H-I1)", pred_te - q_lo_n * s_te, pred_te + q_hi_n * s_te)
+
+
+def experiment_9_log_target(table: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-G2. Кинетика HDS интегрируется в степенной/логарифмический закон, а
+    не линейный: dCs/dt = -k*Cs^n. Гипотеза: предсказывать ln(сера), а не
+    серу. Два ожидаемых эффекта:
+      1) остаток в лог-пространстве лучше себя ведёт (ошибка
+         мультипликативная, а не аддитивная);
+      2) конформный интервал после обратного exp становится
+         ПРОПОРЦИОНАЛЬНЫМ -- узким при низкой сере. Gate проверяет
+         верхнюю границу у лимита 10 мг/кг, поэтому важна ширина именно
+         в зоне 8-10, а не средняя по всему диапазону.
+
+    Обе метрики считаются в ИСХОДНОМ пространстве (после exp), иначе
+    сравнение нечестное. Сплит по пробам, TEST честный.
+    """
+    print("\n=== Эксперимент 9 (H-G2): предсказывать ln(сера) вместо серы ===")
+    import lightgbm as lgb
+    from src.models.conformal import finite_sample_quantile
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+    tbl = tbl[tbl["y"] > 0.05]  # ln нужен положительный аргумент
+
+    samples = np.sort(tbl["_lims_ts"].unique())
+    s_train, s_calib = samples[int(len(samples) * 0.70)], samples[int(len(samples) * 0.85)]
+    tr = tbl[tbl["_lims_ts"] < s_train]
+    ca = tbl[(tbl["_lims_ts"] >= s_train) & (tbl["_lims_ts"] < s_calib)]
+    te = tbl[tbl["_lims_ts"] >= s_calib]
+    print(f"  train={len(tr)} / calib={len(ca)} / TEST={len(te)}")
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    alpha = 0.10
+
+    def base_of(df):
+        return df[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+
+    def make_model(n):
+        return lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                  num_leaves=15, min_child_samples=max(5, n // 50),
+                                  random_state=42, verbose=-1)
+
+    def evaluate(label, pred_te, lo_te, hi_te):
+        y = te["y"].values
+        rmse = float(np.sqrt(((pred_te - y) ** 2).mean()))
+        cov = float(np.mean(y <= hi_te))
+        width = hi_te - lo_te
+        near = (pred_te >= 8.0) & (pred_te <= 10.0)   # зона, где Gate решает
+        print(f"  {label}")
+        print(f"    RMSE={rmse:.3f}  покрытие по hi={cov:.3f}  средняя ширина={width.mean():.2f}")
+        if near.sum() >= 20:
+            print(f"    В ЗОНЕ 8-10 мг/кг (n={int(near.sum())}): ширина={width[near].mean():.2f}"
+                  f"  средний запас до 10 по hi={np.mean(10.0 - hi_te[near]):+.2f}")
+        else:
+            print(f"    В зоне 8-10 мг/кг точек мало (n={int(near.sum())})")
+
+    # --- A: как сейчас, линейная цель ---
+    m_lin = make_model(len(tr))
+    m_lin.fit(tr[SULFUR_FEATURES].rename(columns=safe), tr["y"] - base_of(tr))
+    pred_ca = (base_of(ca) + m_lin.predict(ca[SULFUR_FEATURES].rename(columns=safe))).values
+    err_ca = ca["y"].values - pred_ca
+    q_hi = finite_sample_quantile(err_ca, alpha)
+    q_lo = finite_sample_quantile(-err_ca, alpha)
+    pred_te = (base_of(te) + m_lin.predict(te[SULFUR_FEATURES].rename(columns=safe))).values
+    evaluate("A: линейная цель (как сейчас)", pred_te, pred_te - q_lo, pred_te + q_hi)
+
+    # --- B: логарифмическая цель ---
+    m_log = make_model(len(tr))
+    m_log.fit(tr[SULFUR_FEATURES].rename(columns=safe),
+              np.log(tr["y"].values) - np.log(base_of(tr).values))
+    lpred_ca = np.log(base_of(ca).values) + m_log.predict(ca[SULFUR_FEATURES].rename(columns=safe))
+    lerr_ca = np.log(ca["y"].values) - lpred_ca
+    lq_hi = finite_sample_quantile(lerr_ca, alpha)
+    lq_lo = finite_sample_quantile(-lerr_ca, alpha)
+    lpred_te = np.log(base_of(te).values) + m_log.predict(te[SULFUR_FEATURES].rename(columns=safe))
+    evaluate("B: логарифмическая цель (H-G2)",
+             np.exp(lpred_te), np.exp(lpred_te - lq_lo), np.exp(lpred_te + lq_hi))
+
+
 def main():
     print("Загрузка данных и артефактов...")
     tel_avt_raw = load_telemetry("AVT")
@@ -267,6 +555,16 @@ def main():
     experiment_3_lagged_feed_d15_vs_residual(avt, tel_avt_raw, tel_go, lims)
     experiment_4_conformal_at_95pct(go)
     experiment_5_true_holdout_test(table)
+
+    experiment_7_effective_sample_size(table, lims)
+    experiment_8_normalized_conformal(table, lims)
+    experiment_9_log_target(table, lims)
+
+    print("\nПересборка таблицы БЕЗ отсечения выбросов (для H-B2)...")
+    table_full, _ = build_sulfur_table(avt, tel_avt_raw, tel_go, lims,
+                                        feed_delay_h=0.0, drop_outliers=False)
+    table_full = table_full.loc[table_full.index.sort_values()]
+    experiment_6_outlier_weighting(table_full)
 
 
 if __name__ == "__main__":

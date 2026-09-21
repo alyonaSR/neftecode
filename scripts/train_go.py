@@ -165,8 +165,12 @@ def main():
         bounds_str = ""
         if sub._conformal is not None:
             offset_lo, offset_hi = sub._conformal.bounds()
+            # H-I1: после условного конформа offsets заданы в единицах sigma(x),
+            # а не в мг/кг -- умножаются на sigma строки в predict_one. Печатаем
+            # это явно, иначе число выглядит как «интервал вдруг стал вдвое уже».
+            units = "x sigma(x)" if sub._sigma_model is not None else "мг/кг (глобальный)"
             bounds_str = (f"  bias={sub._resid_bias:.2f}  "
-                          f"conformal offset=[{offset_lo:.2f}, {offset_hi:.2f}]")
+                          f"conformal offset=[{offset_lo:.2f}, {offset_hi:.2f}] {units}")
         print(f"  {out}: RMSE baseline={rmse_before:.3f}  train={sub._n_train} "
               f"calib={sub._n_calib}{bounds_str}")
 

@@ -95,6 +95,34 @@ def test_aci_narrows_after_stable_period():
     assert hi_after < hi_before
 
 
+def test_normalized_interval_is_narrower_in_calm_regime():
+    """
+    H-I1: условный конформный интервал должен быть УЖЕ в спокойном режиме
+    (низкая волатильность T5) и ШИРЕ в турбулентном. Раньше он был
+    одинаковый везде, и в спокойном режиме запас до лимита отдавался
+    впустую. Тест на свойство, не на точность.
+    """
+    import os
+    from src.models.go import GOModel
+    from tests.test_models import GO_BASE
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "artifacts", "models", "go_v1.joblib")
+    if not os.path.exists(path):
+        print("  SKIP test_normalized_interval_is_narrower_in_calm_regime (нет артефакта)")
+        return
+    m = GOModel.load(path)
+    if m._models["sulfur_mgkg"]._sigma_model is None:
+        print("  SKIP (артефакт обучен до H-I1, sigma-модели нет)")
+        return
+
+    calm = {**GO_BASE, "242000:T5__std3h": 0.2, "242000:T5__std6h": 0.2}
+    turbulent = {**GO_BASE, "242000:T5__std3h": 6.0, "242000:T5__std6h": 6.0}
+    w_calm = m.predict(calm)["sulfur_mgkg"].width
+    w_turb = m.predict(turbulent)["sulfur_mgkg"].width
+    assert w_turb > w_calm, f"ожидали шире в турбулентном: calm={w_calm:.2f} turb={w_turb:.2f}"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_"):
