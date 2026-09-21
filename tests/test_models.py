@@ -117,6 +117,55 @@ def test_go_heavier_feed_means_more_sulfur():
     assert heavy >= light
 
 
+def test_effect_of_heating_lowers_sulfur_on_trained_model():
+    """
+    Регрессия на H-L1 (2026-09-22). Соседний тест
+    test_go_hotter_reactor_means_less_sulfur строит GOModel() ПУСТОЙ, то
+    есть проверяет одну формулу -- и потому годами проходил, пока реальный
+    обученный артефакт давал ОБРАТНЫЙ знак: отклик на +2 C был +0.197 мг/кг
+    вместо -0.254, неверный знак у 59.4% точек.
+
+    Причина -- monotone_constraints в LightGBM действуют ПОКОЛОНОЧНО:
+    знак задан для 242000:T5, но производные от неё (arrhenius_t5,
+    q20_x_arrhenius, T5_T6_quench_delta) знака не имеют, и ограничение
+    обходится через них.
+
+    Здесь проверяется ОБУЧЕННЫЙ артефакт и именно тот путь, которым
+    пользуется Optimizer -- predict_effect, где эффект берётся из формулы.
+    """
+    m = _load_go_or_skip("test_effect_of_heating_lowers_sulfur_on_trained_model")
+    if m is None:
+        return
+    for t5 in (360.0, 370.0, 380.0):
+        now = {**GO_BASE, "242000:T5": t5}
+        hotter = {**GO_BASE, "242000:T5": t5 + 2.0}
+        effect = m.predict_effect(now, hotter)["sulfur_mgkg"]
+        assert effect < 0, (
+            f"нагрев на +2 C при T5={t5} должен СНИЖАТЬ серу, получено {effect:+.3f}"
+        )
+
+
+def test_derived_features_are_computed_from_raw_tags():
+    """
+    Регрессия на training/serving skew (2026-09-22). Фичеинжиниринг серы
+    жил только в обучающих скриптах, а путь инференса клал в модель сырые
+    теги -- 10 из 12 телеметрийных признаков приходили как NaN, и прогноз
+    в демо выходил 3.65 мг/кг при реальной медиане 8.6.
+    """
+    raw = {"242000:T5": 370.0, "242000:T6": 364.0, "242000:Q20": 9500.0,
+           "242000:F25": 22000.0, "242000:F9": 190.0}
+    d = GOModel.derive_features(raw)
+    assert d["242000:T5_T6_quench_delta"] == 6.0
+    assert d["242000:h2_oil_ratio"] == 22000.0 / 190.0
+    assert 0.0 < d["242000:arrhenius_t5"] < 1.0
+    assert d["242000:q20_x_arrhenius"] == 9500.0 * d["242000:arrhenius_t5"]
+    # уже посчитанное вызывающим кодом не перетирается
+    assert GOModel.derive_features({**raw, "242000:h2_oil_ratio": 1.0})[
+        "242000:h2_oil_ratio"] == 1.0
+    # отсутствующее сырьё не роняет
+    GOModel.derive_features({"242000:T5": 370.0})
+
+
 def test_missing_features_are_reported_not_raised():
     m = GOModel()
     assert "242000:T5" in m.check_features({"catalyst_age_days": 500.0})

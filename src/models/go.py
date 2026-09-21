@@ -51,6 +51,7 @@ from typing import Dict, Mapping, Optional
 from ..contracts import Interval
 from . import vak_formulas as vak
 from .base import BaseQualityModel, monotone_vector
+from .features import arrhenius_term
 from .formula_residual import FormulaPlusResidual
 
 # ---------------------------------------------------------------------
@@ -181,8 +182,14 @@ class GOModel(BaseQualityModel):
     """
 
     outputs = ["sulfur_mgkg", "flash_c", "cfpp_c", "d15_kgm3"]
-    required_features = sorted({t for _, tags, _ in _SPECS.values() for t in tags})
-    model_id = "go_formula_residual_v2"
+    # СЫРЬЁ для производных признаков (242000:T6, 242000:F25) тоже обязано
+    # попасть в state, иначе derive_features() нечего будет считать -- см.
+    # ниже про training/serving skew.
+    _DERIVED_INPUTS = ["242000:T6", "242000:F25"]
+    required_features = sorted(
+        {t for _, tags, _ in _SPECS.values() for t in tags} | set(_DERIVED_INPUTS)
+    )
+    model_id = "go_formula_residual_v3"
 
     def __init__(self, models: Optional[Dict[str, FormulaPlusResidual]] = None):
         self._models = models or {
@@ -198,7 +205,96 @@ class GOModel(BaseQualityModel):
         }
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def derive_features(features: Dict[str, float]) -> Dict[str, float]:
+        """
+        Досчитывает производные признаки из сырых тегов.
+
+        ЗАЧЕМ. Фичеинжиниринг серы жил ТОЛЬКО в обучающих скриптах
+        (build_sulfur_table в train_go.py и experiments_sulfur.py), а путь
+        инференса -- state_builder -> quality.py -> GOModel.predict --
+        клал в модель одни сырые теги. Производные признаки приходили как
+        NaN, то есть модель работала без них. Классический training/serving
+        skew: обучали на одном наборе, предсказывали на другом.
+
+        Замер до исправления (2026-09-22): из 12 телеметрийных признаков
+        серы на реальном пути ОТСУТСТВОВАЛО 10, доходили только T5 и Q20.
+        В демо-сценарии прогноз выходил 3.65 мг/кг при реальной медиане
+        8.6 -- Gate видел несуществующий запас до лимита 10.
+
+        Лаги и скользящие (T5__lag3h, Q20__lag6h, T5__std3h, ...) отсюда
+        НЕ восстановить -- они требуют истории, а на вход приходит срез в
+        одной точке времени. Их должен подавать state_builder; здесь они
+        остаются как есть.
+
+        Функция чистая: не трогает то, что уже передано (если вызывающий
+        посчитал признак сам -- его значение в приоритете), и не ломается
+        на отсутствующем сырье.
+        """
+        f = dict(features)
+
+        def val(key):
+            v = f.get(key)
+            return None if v is None or (isinstance(v, float) and math.isnan(v)) else float(v)
+
+        def put(key, value):
+            if val(key) is None and value is not None:
+                f[key] = value
+
+        t5, t6 = val("242000:T5"), val("242000:T6")
+        q20 = val("242000:Q20")
+        f25, f9 = val("242000:F25"), val("242000:F9")
+
+        if t5 is not None:
+            put("242000:arrhenius_t5", float(arrhenius_term(t5)))
+        if t5 is not None and t6 is not None:
+            put("242000:T5_T6_quench_delta", t5 - t6)
+        if f25 is not None and f9:
+            put("242000:h2_oil_ratio", f25 / f9)
+        arr = val("242000:arrhenius_t5")
+        if q20 is not None and arr is not None:
+            put("242000:q20_x_arrhenius", q20 * arr)
+        return f
+
+    # ------------------------------------------------------------------
+    def predict_effect(self, features_now: Dict[str, float],
+                       features_new: Dict[str, float]) -> Dict[str, float]:
+        """
+        Насколько изменится качество, если перейти из режима `now` в `new`.
+        Считается ТОЛЬКО по физической формуле, БЕЗ ML-остатка.
+
+        ЗАЧЕМ ИМЕННО ТАК (H-L1, SULFUR_HYPOTHESES.md, 2026-09-22). Замер
+        отклика на +2 C по T5 на отложенных данных:
+
+            чистая формула Аррениуса:  -0.254 мг/кг, неверный знак у 0.0%
+            формула + ML-остаток:      +0.197 мг/кг, неверный знак у 59.4%
+
+        То есть ML-остаток не просто шумит, а УВЕРЕННО переворачивает знак:
+        модель считает, что нагрев реактора ПОВЫШАЕТ серу. Физика требует
+        обратного (выше T -> глубже HDS -> меньше серы).
+
+        Почему это не ловится monotone_constraints: LightGBM ограничивает
+        монотонность ПОКОЛОНОЧНО. Знак задан для 242000:T5, но производные
+        от неё -- arrhenius_t5 (строго возрастает по T), q20_x_arrhenius,
+        T5_T6_quench_delta -- знака не имеют, и ограничение обходится через
+        них. Попытка зажать и их делает отклик нулевым (+0.011), а RMSE
+        хуже (2.232 -> 2.501): получаем мёртвый рычаг вместо перевёрнутого.
+
+        Поэтому разделение по схеме, предложенной Person 2 (2026-09-22):
+            УРОВЕНЬ  -- откуда мы стартуем, берётся из свежего замера
+                        (ЛИМС/ПАК) в quality.py._sulfur_anchored;
+            ЭФФЕКТ   -- насколько сдвинет действие, берётся ОТСЮДА.
+        Прогноз кандидата = уровень + эффект. Точность уровня даёт прибор,
+        физически верную чувствительность -- формула.
+        """
+        now = self.derive_features(features_now)
+        new = self.derive_features(features_new)
+        return {name: m.baseline(new) - m.baseline(now)
+                for name, m in self._models.items()}
+
+    # ------------------------------------------------------------------
     def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
+        features = self.derive_features(features)
         out = {name: model.predict_one(features) for name, model in self._models.items()}
         for name, fn in _APPROX.items():
             mean = float(fn(features))

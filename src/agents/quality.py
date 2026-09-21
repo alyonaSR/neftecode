@@ -100,13 +100,24 @@ class QualityAgent:
             k: go_new[k].mean - go_now[k].mean for k in go_new
         }
 
+        # H-L1 (2026-09-22): эффект по сере берётся ИЗ ФОРМУЛЫ, а не как
+        # разница двух полных прогнозов. ML-остаток переворачивает знак
+        # отклика на температуру (+0.197 вместо -0.254 мг/кг на +2 C,
+        # неверный знак у 59.4% точек) -- подробности в GOModel.predict_effect
+        # и SULFUR_HYPOTHESES.md. Уровень по-прежнему из свежего замера.
+        sulfur_effect = self.go.predict_effect(
+            go_features(avt_now, go_raw_now), go_features(avt_new, go_raw_new)
+        )["sulfur_mgkg"]
+
         go_new["sulfur_mgkg"] = self._sulfur_anchored(
-            state, go_now["sulfur_mgkg"], go_new["sulfur_mgkg"]
+            state, go_now["sulfur_mgkg"], go_new["sulfur_mgkg"],
+            effect=sulfur_effect,
         )
         return go_new
 
     def _sulfur_anchored(
-        self, state: ProcessState, now_iv: Interval, new_iv: Interval
+        self, state: ProcessState, now_iv: Interval, new_iv: Interval,
+        effect: Optional[float] = None,
     ) -> Interval:
         cfg = load_config("constraints")["sulfur_anchor"]
         max_age = refusal_rules()["max_lims_age_min"]
@@ -115,7 +126,10 @@ class QualityAgent:
             return new_iv
 
         anchor = state.freshest_usable("sulfur_mgkg", max_age)
-        effect = new_iv.mean - now_iv.mean
+        # effect=None -- прежнее поведение (разница полных прогнозов);
+        # вызывающий код передаёт формульный эффект, см. H-L1 выше.
+        if effect is None:
+            effect = new_iv.mean - now_iv.mean
         horizon_min = cfg["cycle_min"] + anchor.age_min
         grid = cfg["growth_q90_mgkg"]
 
