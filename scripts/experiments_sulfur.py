@@ -737,6 +737,219 @@ def experiment_12_q21_multisplit(table: pd.DataFrame, tel_go: pd.DataFrame, lims
         print("  => эффект НЕ устойчив: находка эксп.11 была особенностью одного сплита")
 
 
+def experiment_13_three_cornered_hat(table: pd.DataFrame, tel_go: pd.DataFrame, lims: pd.DataFrame):
+    """
+    H-K1: потолок 2.253 (H-F1) посчитан как расхождение ЛИМС и ПАК. Но это
+    расхождение ДВУХ шумных приборов:
+
+        RMSE(ЛИМС, ПАК)^2 ~ sigma_ЛИМС^2 + sigma_ПАК^2
+
+    Модель же сравнивается с ЛИМС, и её измеренная ошибка
+
+        RMSE(ЛИМС, модель)^2 ~ sigma_модель^2 + sigma_ЛИМС^2
+
+    то есть НЕДОСТИЖИМЫЙ минимум для нашей метрики -- это sigma_ЛИМС В ОДИНОЧКУ,
+    а вовсе не 2.253. Если sigma_ЛИМС заметно меньше 2.253, зазор для улучшения
+    больше, чем мы считали, и ветку RMSE рано закрывать.
+
+    Разложение возможно, потому что у нас ТРИ оценки одной величины: ЛИМС (A),
+    ПАК/Q21 (B) и модель (C). Метод трёх углов (three-cornered hat, оценка
+    Граббса) даёт каждую дисперсию из трёх попарных расхождений:
+
+        sigma_A^2 = (V_AB + V_AC - V_BC) / 2   и циклически
+
+    Условия: ошибки трёх "приборов" независимы и аддитивны. Встроенная
+    проверка -- все три sigma^2 должны выйти НЕОТРИЦАТЕЛЬНЫМИ; отрицательная
+    означает нарушение независимости (это и есть замер H-K2).
+
+    Два принципиальных требования к честности замера:
+      1. Прогноз модели должен быть ВНЕ ВЫБОРКИ. Иначе sigma_модель занижена и
+         всё разложение поедет. Здесь -- расширяющееся окно walk-forward по
+         второй половине проб.
+      2. Считаем по ПРОБАМ, а не по строкам телеметрии (урок H-H1: на одну
+         пробу приходится ~7 строк с одной меткой).
+    """
+    print("\n=== Эксперимент 13 (H-K1): разложение потолка методом трёх углов ===")
+    import lightgbm as lgb
+
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    samples = np.sort(tbl["_lims_ts"].unique())
+    bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
+
+    # --- C: честный прогноз вне выборки для второй половины проб ---
+    blocks = []
+    for i in range(5):
+        lo_i, hi_i = bounds[i], bounds[i + 1]
+        if hi_i <= lo_i:
+            continue
+        cut_lo, cut_hi = samples[lo_i], samples[hi_i - 1]
+        tr = tbl[tbl["_lims_ts"] < cut_lo]
+        te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
+        if len(tr) < 200 or len(te) < 20:
+            continue
+        base = tr[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                               random_state=42, verbose=-1)
+        m.fit(tr[SULFUR_FEATURES].rename(columns=safe), tr["y"] - base)
+        base_t = te[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + m.predict(te[SULFUR_FEATURES].rename(columns=safe))
+        blocks.append(pd.DataFrame({"_lims_ts": te["_lims_ts"].values,
+                                     "A": te["y"].values, "C": pred.values}))
+
+    oos = pd.concat(blocks)
+    per = oos.groupby("_lims_ts").agg(A=("A", "first"), C=("C", "mean")).reset_index()
+    per = per.rename(columns={"_lims_ts": "ts"}).sort_values("ts")
+
+    # --- B: показание поточного анализатора Q21, ближайшее к отбору пробы ---
+    q = tel_go[["242000:Q21"]].dropna().sort_index()
+    stuck = q["242000:Q21"].rolling("6h").std().fillna(0.0)
+    qdf = pd.DataFrame({"ts": q.index, "B": q["242000:Q21"].values,
+                        "B_std6h": stuck.values}).sort_values("ts")
+    per = pd.merge_asof(per, qdf, on="ts", direction="nearest",
+                         tolerance=pd.Timedelta(minutes=15)).dropna()
+    per = per[per["B"] <= SULFUR_OUTLIER_THRESHOLD]
+
+    def grubbs(df, label):
+        A, B, C = df["A"].values, df["B"].values, df["C"].values
+        # дисперсии РАЗНОСТЕЙ (центрированные): систематический сдвиг между
+        # приборами -- это калибровка, а не шум, его выносим отдельно
+        v_ab = float(np.var(A - B, ddof=1))
+        v_ac = float(np.var(A - C, ddof=1))
+        v_bc = float(np.var(B - C, ddof=1))
+        s2 = {"ЛИМС": (v_ab + v_ac - v_bc) / 2,
+              "ПАК Q21": (v_ab + v_bc - v_ac) / 2,
+              "модель": (v_ac + v_bc - v_ab) / 2}
+        print(f"\n  --- {label} (проб: {len(df)}) ---")
+        print(f"  сдвиги (систематика): ЛИМС-ПАК={np.mean(A - B):+.2f}  "
+              f"ЛИМС-модель={np.mean(A - C):+.2f}  мг/кг")
+        print(f"  попарные RMSE:  ЛИМС/ПАК={np.sqrt(np.mean((A-B)**2)):.3f}  "
+              f"ЛИМС/модель={np.sqrt(np.mean((A-C)**2)):.3f}  "
+              f"ПАК/модель={np.sqrt(np.mean((B-C)**2)):.3f}")
+        print("  разложение Граббса (собственный шум каждого источника):")
+        ok = True
+        for k, v in s2.items():
+            if v < 0:
+                ok = False
+                print(f"    sigma_{k:<9} = ОТРИЦАТЕЛЬНА ({v:.2f}) -- независимость нарушена")
+            else:
+                print(f"    sigma_{k:<9} = {np.sqrt(v):.3f} мг/кг")
+        if ok:
+            print(f"  => НАСТОЯЩИЙ потолок для метрики [модель vs ЛИМС] = "
+                  f"sigma_ЛИМС = {np.sqrt(s2['ЛИМС']):.3f} (а не 2.253)")
+            print(f"     собственная ошибка модели sigma_модель = {np.sqrt(s2['модель']):.3f}")
+        return s2, ok
+
+    grubbs(per, "все пробы")
+    calm = per[per["B_std6h"] > 1e-9]
+    if len(calm) >= 100:
+        grubbs(calm, "без залипаний ПАК (std Q21 за 6ч > 0)")
+    else:
+        print(f"\n  (проб без залипаний ПАК всего {len(calm)} -- отдельный срез не считаю)")
+
+
+def experiment_14_skill_vs_constant(table: pd.DataFrame, go: GOModel, tel_go: pd.DataFrame,
+                                     lims: pd.DataFrame):
+    """
+    H-K3 (порождена H-K1): бьёт ли модель ТРИВИАЛЬНУЮ базу?
+
+    За всю кампанию модель серы сравнивалась с формулой Аррениуса и сама с
+    собой, но НИ РАЗУ -- с нулевой гипотезой "всегда предсказываем константу".
+    Пока потолок считался равным 2.253, а результат 2.28 -- вопрос казался
+    закрытым. H-K1 сдвинул потолок до ~1.16, и вопрос открылся заново.
+
+    Замеряем на ДВУХ протоколах, чтобы исключить артефакт разбиения:
+      A. хвост по времени (ровно то, по чему репортился RMSE=2.155) --
+         с ПРОДАКШЕН-артефактом go_v1.joblib, без переобучения;
+      B. walk-forward из 5 блоков по второй половине проб -- переобучение
+         в каждом блоке, сравнение с константой, формулой и ПАК Q21.
+
+    Константа берётся как СРЕДНЕЕ обучающей выборки (оно минимизирует RMSE;
+    медиана была бы поддавком модели) и, разумеется, только по трейну.
+    """
+    print("\n=== Эксперимент 14 (H-K3): модель против константы ===")
+    import lightgbm as lgb
+
+    print("\n  -- протокол A: хвост по времени, ПРОДАКШЕН-артефакт --")
+    for frac in (0.80, 0.85):
+        cut = int(len(table) * frac)
+        tr, te = table.iloc[:cut], table.iloc[cut:]
+        y = te["y"].values
+        pred = np.array([go._models["sulfur_mgkg"].predict_one(r.to_dict()).mean
+                          for _, r in te[SULFUR_FEATURES].iterrows()])
+        rmse = lambda p: float(np.sqrt(np.mean((p - y) ** 2)))
+        c = float(tr["y"].mean())
+        r_c, r_m = rmse(np.full(len(y), c)), rmse(pred)
+        print(f"    разрез {frac:.2f} (n_test={len(te)}): константа={c:.2f} -> RMSE {r_c:.3f}   "
+              f"модель -> RMSE {r_m:.3f}   skill {100*(1-r_m/r_c):+.1f}%")
+
+    print("\n  -- протокол B: walk-forward, переобучение в каждом блоке --")
+    sul = lims[(lims["sample_point"] == TARGET_POINT) & (lims["param"] == "sulfur_mgkg")][["ts", "value"]]
+    sul = sul.dropna().sort_values("ts")
+    sul = sul[sul["value"] <= SULFUR_OUTLIER_THRESHOLD]
+    left = pd.DataFrame({"ts": table.index}).sort_values("ts")
+    link = pd.merge_asof(left, sul.assign(lims_ts=sul["ts"]), on="ts",
+                          direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
+    tbl = table.loc[link["ts"].values].copy()
+    tbl["_lims_ts"] = link["lims_ts"].values
+
+    q = tel_go[["242000:Q21"]].dropna().sort_index()
+    qdf = pd.DataFrame({"ts": q.index, "B": q["242000:Q21"].values}).sort_values("ts")
+    safe = {c: c.replace(":", "__") for c in SULFUR_FEATURES}
+    samples = np.sort(tbl["_lims_ts"].unique())
+    bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
+
+    print(f"    {'блок':<6}{'n':>6}{'константа':>11}{'формула':>10}{'модель':>9}{'ПАК Q21':>10}")
+    acc = {"const": [], "base": [], "model": [], "pak": []}
+    for i in range(5):
+        lo_i, hi_i = bounds[i], bounds[i + 1]
+        cut_lo, cut_hi = samples[lo_i], samples[hi_i - 1]
+        tr = tbl[tbl["_lims_ts"] < cut_lo]
+        te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
+        if len(tr) < 200 or len(te) < 20:
+            continue
+        base = tr[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                               num_leaves=15, min_child_samples=max(5, len(tr) // 50),
+                               random_state=42, verbose=-1)
+        m.fit(tr[SULFUR_FEATURES].rename(columns=safe), tr["y"] - base)
+        base_t = te[["242000:T5"]].apply(lambda r: sulfur_arrhenius_baseline(r), axis=1)
+        pred = base_t + m.predict(te[SULFUR_FEATURES].rename(columns=safe))
+        y = te["y"]
+        rmse = lambda p: float(np.sqrt(((p - y) ** 2).mean()))
+        j = pd.merge_asof(pd.DataFrame({"ts": te.index, "y": y.values}).sort_values("ts"),
+                           qdf, on="ts", direction="nearest",
+                           tolerance=pd.Timedelta(minutes=15)).dropna()
+        j = j[j["B"] <= SULFUR_OUTLIER_THRESHOLD]
+        vals = (rmse(np.full(len(y), tr["y"].mean())), rmse(base_t), rmse(pred),
+                float(np.sqrt(((j["B"] - j["y"]) ** 2).mean())))
+        for k, v in zip(acc, vals):
+            acc[k].append(v)
+        print(f"    {i+1:<6}{len(te):>6}{vals[0]:>11.3f}{vals[1]:>10.3f}{vals[2]:>9.3f}{vals[3]:>10.3f}")
+
+    mc, mm = float(np.mean(acc["const"])), float(np.mean(acc["model"]))
+    print(f"    {'сред.':<6}{'':>6}{mc:>11.3f}{np.mean(acc['base']):>10.3f}"
+          f"{mm:>9.3f}{np.mean(acc['pak']):>10.3f}")
+    worse = sum(1 for a, b in zip(acc["const"], acc["model"]) if b > a)
+    print()
+    print(f"  skill score модели против константы: {100*(1-mm/mc):+.1f}%  "
+          f"(модель хуже константы в {worse} блоках из {len(acc['model'])})")
+    if mm >= mc:
+        print("  => У МОДЕЛИ НЕТ НАВЫКА как у точечного прогноза: константа не хуже.")
+        print("     ML-слой поверх формулы реально помогает (см. эксп.1), но вся связка")
+        print("     формула+остаток не дотягивает до тривиальной базы. При этом сигнал")
+        print("     в данных ЕСТЬ: ПАК Q21 предсказывает ЛИМС заметно лучше константы.")
+
+
 def main():
     print("Загрузка данных и артефактов...")
     tel_avt_raw = load_telemetry("AVT")
@@ -767,6 +980,8 @@ def main():
     experiment_10_remaining_features(table, tel_go, lims)
     experiment_11_q21_go_no_go(table, tel_go, lims)
     experiment_12_q21_multisplit(table, tel_go, lims)
+    experiment_13_three_cornered_hat(table, tel_go, lims)
+    experiment_14_skill_vs_constant(table, go, tel_go, lims)
 
     print("\nПересборка таблицы БЕЗ отсечения выбросов (для H-B2)...")
     table_full, _ = build_sulfur_table(avt, tel_avt_raw, tel_go, lims,
