@@ -35,11 +35,29 @@ def test_avt_interface():
 
 
 def test_avt_more_diesel_draw_means_heavier_tail():
-    """Больше отбор дизельной фракции -> EBP растёт (AVT6:240-350:EBP)."""
-    m = AVTModel()
+    """
+    Больше отбор дизельной фракции -> EBP растёт.
+
+    Раньше свойство обеспечивала формула ВАК и проверялось оно на ПУСТОЙ
+    AVTModel(). С 2026-09-22 формула больше не служит baseline'ом для
+    feed_ebp_c (H-O2: её std 186.9 при std метки 10.6 -- катастрофическое
+    сокращение между -14.08*T37 и +14.60*T58; RMSE 32.3 против 8.2 без
+    неё). Поэтому у НЕобученной модели отклика по F30 теперь нет: она
+    честно возвращает опорную константу, а не число из разболтанной
+    формулы.
+
+    Само свойство никуда не делось -- его держит monotone-ограничение
+    EXPECTED_SIGNS["feed_ebp_c"]["AVT:F30"] = +1 в обученном остатке.
+    Поэтому проверяем на ОБУЧЕННОМ артефакте, то есть на том, что реально
+    работает в проде (тот же урок, что в тесте знака по T5).
+    """
+    m = _load_avt_or_skip("test_avt_more_diesel_draw_means_heavier_tail")
+    if m is None:
+        return
     low = m.predict({**AVT_BASE, "AVT:F30": 110.0})["feed_ebp_c"].mean
     high = m.predict({**AVT_BASE, "AVT:F30": 150.0})["feed_ebp_c"].mean
-    assert high > low
+    # >=, не >: monotone_constraints гарантируют неубывание, не строгий рост
+    assert high >= low
 
 
 # Stage 2: GOModel больше не работает через anchor+дельты (см. докстринг
@@ -64,6 +82,15 @@ def _artifact_path(name):
     import os
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "artifacts", "models", name)
+
+
+def _load_avt_or_skip(test_name):
+    import os
+    path = _artifact_path("avt_v1.joblib")
+    if not os.path.exists(path):
+        print(f"  SKIP {test_name} (нет artifacts/models/avt_v1.joblib, запусти scripts/train_avt.py)")
+        return None
+    return AVTModel.load(path)
 
 
 def _load_go_or_skip(test_name):

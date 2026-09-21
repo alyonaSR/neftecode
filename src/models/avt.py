@@ -79,6 +79,36 @@ _SPECS = {
 }
 
 
+# Показатели, у которых формула ВАК НЕ используется как baseline.
+#
+# feed_ebp_c (H-O2, SULFUR_HYPOTHESES.md, 2026-09-22). Формула
+# транскрибирована верно и теги сопоставлены верно -- проверено против
+# формулы_ВАК.xlsx построчно. Дефект в её ОБУСЛОВЛЕННОСТИ: она содержит
+# -14.08235*T37 и +14.60206*T58, вклады -857.67 и +851.72, в сумме +3.38.
+# Слагаемые по 860 гасят друг друга, но только В СРЕДНЕМ: corr(T37,T58)
+# = 0.62, а не ~1, и расхождение этих температур на 1 C стоит ~14 C на
+# выходе. Итог: std формулы 186.88 при std самой метки 10.62 -- формула
+# в 18 раз шумнее величины, которую описывает (catastrophic cancellation).
+# Остаток тратил всю ёмкость на то, чтобы её гасить.
+#
+# Замер (walk-forward, 5 блоков, против константы = среднее трейна):
+#     baseline = формула              RMSE 32.335   skill -328.0%
+#     baseline = формула, обрезанная  RMSE 24.442   skill -223.5%
+#     БЕЗ формулы, чистый ML          RMSE  8.203   skill   -8.6%
+#
+# Формула при этом НЕ выбрасывается: её входные теги остаются признаками
+# остатка, и scripts/train_avt.py по-прежнему выбирает ею точку отбора
+# ЛИМС (corr 0.206 слабая, но точку определяет верно -- у чистого нуля
+# корреляции нет вовсе, и выбор точки становится случайным, как это
+# видно у feed_flash_c).
+_NO_FORMULA_BASELINE = {"feed_ebp_c"}
+
+
+def _baseline_fn(out: str, fn):
+    """Формула как baseline -- или None, если она вредит (см. выше)."""
+    return None if out in _NO_FORMULA_BASELINE else fn
+
+
 class AVTModel(BaseQualityModel):
     """
     Композиция из четырёх FormulaPlusResidual, по одному на показатель.
@@ -93,12 +123,12 @@ class AVTModel(BaseQualityModel):
 
     outputs = ["feed_ebp_c", "feed_d15_kgm3", "feed_cfpp_c", "feed_flash_c"]
     required_features = sorted({t for _, tags, extra, _ in _SPECS.values() for t in tags + extra})
-    model_id = "avt_formula_residual_v2"
+    model_id = "avt_formula_residual_v3"
 
     def __init__(self, models: Optional[Dict[str, FormulaPlusResidual]] = None):
         self._models = models or {
             out: FormulaPlusResidual(
-                name=out, formula_fn=fn, formula_tags=tags,
+                name=out, formula_fn=_baseline_fn(out, fn), formula_tags=tags,
                 feature_cols=tags + extra, fallback_mean=fb,
                 # monotone constraints: см. base.EXPECTED_SIGNS и находку
                 # Person 1 (feed_ebp_c немонотонен по активному рычагу
@@ -138,7 +168,7 @@ class AVTModel(BaseQualityModel):
         states = joblib.load(path)
         models = {
             out: FormulaPlusResidual.from_state(
-                states[out], fn, tags, tags + extra,
+                states[out], _baseline_fn(out, fn), tags, tags + extra,
                 monotone=monotone_vector(tags + extra, out), fallback_mean=fb,
             )
             for out, (fn, tags, extra, fb) in _SPECS.items()

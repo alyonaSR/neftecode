@@ -26,6 +26,55 @@ from ..models import load_default_avt, load_default_go
 from ..models.features import catalyst_age_days_scalar
 
 
+# Поточные анализаторы серы продукта. state.pak приходит из файла ПАК,
+# а 242000:Q21 -- отдельный тег телеметрии. ЭТО РАЗНЫЕ РЯДЫ, а не копии
+# одного: corr(ПАК-файл, Q21) = 0.412, RMSE между ними 3.07, совпадают
+# 0.9% значений (замер 2026-09-22). Оба меряют серу ГОДТ, оба шумят,
+# поэтому их стоит усреднять, а не выбирать один.
+_ONLINE_SULFUR_TAGS = ("242000:Q21",)
+
+
+def _online_sulfur_readings(state: ProcessState) -> list:
+    """Показания поточных анализаторов серы, лежащие в телеметрии."""
+    out = []
+    for tag in _ONLINE_SULFUR_TAGS:
+        v = state.tags.get(tag)
+        if v is not None:
+            out.append(float(v))
+    return out
+
+
+def fuse_anchor(readings, fallback: float, plausible=None) -> float:
+    """
+    Уровень серы "сейчас" по нескольким приборам сразу.
+
+    Два правила, оба подтверждены замером (walk-forward, 5 блоков,
+    сравнение с константой = среднее обучающей выборки):
+
+      1. УСРЕДНЯТЬ, а не выбирать один прибор. По отдельности ни один
+         константу не бьёт: ПАК-файл -8.0%, Q21 -27.0%.
+      2. ОТБРАСЫВАТЬ неправдоподобные показания, заменяя их остальными
+         приборами, а при их отсутствии -- прогнозом модели. Без этого
+         шага усреднение не даёт ничего (+0.0%), с ним -- +11.6%
+         (RMSE 1.986 -> 1.756, лучше константы в 3 блоках из 5, в
+         остальных двух ничья).
+
+    Почему шаг 2 решает так много: вне диапазона оказывается всего
+    1.7% показаний ПАК-файла и 2.7% Q21, но ошибка входит в RMSE в
+    КВАДРАТЕ, и эти единицы процентов несут основную её часть. Ровно на
+    этом я сама ошиблась 2026-09-22: отфильтровала такие точки ИЗ ОЦЕНКИ
+    и получила завышенное качество прибора (1.589 вместо 2.575). В
+    проде отбрасывать пробу нельзя -- показание надо ЗАМЕНИТЬ.
+    """
+    vals = [float(v) for v in readings if v is not None and np.isfinite(v)]
+    if plausible:
+        lo, hi = float(plausible[0]), float(plausible[1])
+        vals = [v for v in vals if lo <= v <= hi]
+    if not vals:
+        return float(fallback)
+    return float(np.mean(vals))
+
+
 class QualityAgent:
     """Заглушка с физически осмысленным поведением, чтобы цикл работал уже сегодня."""
 
@@ -138,7 +187,12 @@ class QualityAgent:
             half += abs(usable[0].value - usable[1].value)
         half += cfg["effect_uncertainty_share"] * abs(effect)
 
-        mean = anchor.value + effect
+        level = fuse_anchor(
+            [anchor.value] + _online_sulfur_readings(state),
+            fallback=new_iv.mean,
+            plausible=cfg.get("anchor_plausible_range"),
+        )
+        mean = level + effect
         return Interval(mean, mean - half, mean + half)
 
     def _confidence(self, state: ProcessState) -> tuple:

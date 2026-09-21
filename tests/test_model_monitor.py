@@ -153,6 +153,7 @@ def test_replay_restores_coverage():
 
     tel = pd.concat([load_telemetry("AVT"), load_telemetry("242000")], axis=1)
     d = replay(tel, load_lims(), load_pak())
-    assert d.hit_raw.mean() < 0.88
-    assert d.hit_mon.mean() >= 0.88
+
+    assert d.hit_mon.mean() >= 0.90
+    assert d.hit_mon.mean() > d.hit_raw.mean()
     assert d.hit_mon.rolling(30).mean().min() > d.hit_raw.rolling(30).mean().min()

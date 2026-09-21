@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.loaders import load_lims, load_telemetry
-from src.models.avt import AVTModel, _SPECS as AVT_SPECS
+from src.models.avt import AVTModel, _baseline_fn, _SPECS as AVT_SPECS
 from src.models.formula_residual import FormulaPlusResidual
 from src.models.go import _SPECS as GO_SPECS
 from src.models.base import monotone_vector
@@ -110,11 +110,14 @@ def main():
     print("\n  --- AVTModel ---")
     for out, (fn, tags, extra, fb) in AVT_SPECS.items():
         feature_cols = list(tags) + list(extra)
+        # точку отбора ЛИМС выбираем ФОРМУЛОЙ (она это делает верно),
+        # а как baseline берём то, что реально стоит в проде -- см.
+        # avt._NO_FORMULA_BASELINE (H-O2: у feed_ebp_c формула вредит).
         t = build_avt_table(out, fn, list(tags), feature_cols, tel_avt, lims, points)
         if t is None:
             continue
         X, y = t
-        walk_forward_skill(X, y, (fn, list(tags), feature_cols, fb), out)
+        walk_forward_skill(X, y, (_baseline_fn(out, fn), list(tags), feature_cols, fb), out)
 
     print("\n  --- GOModel ---")
     avt = AVTModel.load(os.path.join(ARTIFACTS, "avt_v1.joblib"))
