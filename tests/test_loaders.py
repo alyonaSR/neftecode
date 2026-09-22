@@ -264,3 +264,37 @@ def test_reliability_works_without_telemetry():
     assert 0.0 <= r.severity_index <= 1.0
     assert any("телеметрия не передана" in a for a in r.assumptions)
     assert r.allowed_ranges
+
+
+HISTORY_NAMES = ["242000:T5__lag3h", "242000:T5__lag6h", "242000:T5__std3h",
+                 "242000:T5__std6h", "242000:Q20__lag3h", "242000:Q20__lag6h"]
+
+
+@needs_data
+def test_history_features_match_training(sources):
+    """Лаги и скользящие в состоянии совпадают с тем, как они считаются при обучении."""
+    from src.models.features import add_lags, add_rolling
+
+    tel, lims, pak = sources
+    base = tel[["242000:T5", "242000:T6", "242000:Q20", "242000:F25", "242000:F9"]].dropna()
+    train = add_rolling(add_lags(base, ["242000:T5", "242000:Q20"], lags_h=(3, 6)),
+                        ["242000:T5"], windows_h=(3, 6))
+    for ts in LEAK_CHECK_DATES[::4]:
+        st = build_state(ts, tel, lims, pak)
+        row = train.loc[:ts].iloc[-1]
+        for n in HISTORY_NAMES:
+            if pd.notna(row[n]):
+                assert st.tag(n) == pytest.approx(float(row[n]), rel=1e-6), f"{n} на {ts}"
+
+
+@needs_data
+def test_history_features_ignore_future(sources):
+    """Порча телеметрии после ts не меняет признаки по истории."""
+    tel, lims, pak = sources
+    ts = datetime(2025, 6, 10, 12, 0)
+    before = build_state(ts, tel, lims, pak)
+    spoiled = tel.copy()
+    spoiled.loc[spoiled.index > ts] = 999.0
+    after = build_state(ts, spoiled, lims, pak)
+    for n in HISTORY_NAMES:
+        assert before.tag(n) == after.tag(n), n

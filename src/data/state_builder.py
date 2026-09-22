@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from ..contracts import Measurement, ProcessState
+from ..models.features import add_lags, add_rolling
 from .loaders import FEED_POINT, TARGET_POINT, detect_stuck
 from .tags import load_config, refusal_rules
 
@@ -29,6 +30,12 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
         "242000:T5__lag6h": 367.8,
         "242000:T5__std3h": 1.95,
         "242000:T5__std6h": 1.68,
+        # для признаков серы: температура после квенча, ВСГ, сера сырья
+        "242000:T6": 362.7,
+        "242000:F25": 13091.4,
+        "242000:Q20": 7913.8,
+        "242000:Q20__lag3h": 7913.8,
+        "242000:Q20__lag6h": 7913.8,
         # для формулы ВАК GODT:CFPP
         "242000:T23": 238.2,
         "242000:P8": 0.186,
@@ -88,6 +95,13 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
 
 TAG_STALE_MIN = 30.0  # мин; тег старше попадает во флаги
 
+# признаки серы по истории, как в scripts/train_go.py
+HISTORY_BASE = ["242000:T5", "242000:T6", "242000:Q20", "242000:F25", "242000:F9"]
+HISTORY_LAGS = {"242000:T5": (3, 6), "242000:Q20": (3, 6)}
+HISTORY_ROLLING = {"242000:T5": (3, 6)}
+HISTORY_ROWS = 60      # полных строк достаточно для лага 6 ч
+HISTORY_SPAN_H = 24    # где искать эти строки
+
 
 def build_state(
     ts: datetime,
@@ -100,6 +114,7 @@ def build_state(
     flags: List[str] = []
 
     tags = _slice_telemetry(ts, telemetry, flags)
+    tags.update(_history_features(ts, telemetry, flags))
     lims = _latest_lims(ts, lims_long, flags)
     pak = _latest_pak(ts, pak_long, flags)
 
@@ -134,6 +149,32 @@ def _slice_telemetry(ts, telemetry: pd.DataFrame, flags: List[str]) -> Dict[str,
         tail = f" и ещё {len(stale) - 5}" if len(stale) > 5 else ""
         flags.append(f"устаревшие теги: {head}{tail}")
     return tags
+
+
+def _history_features(ts, telemetry: pd.DataFrame, flags: List[str]) -> Dict[str, float]:
+    """Лаги и скользящие признаки серы на момент ts теми же функциями, что при обучении."""
+    if telemetry is None or telemetry.empty or not set(HISTORY_BASE) <= set(telemetry.columns):
+        return {}
+    win = telemetry.loc[ts - pd.Timedelta(hours=HISTORY_SPAN_H):ts, HISTORY_BASE].dropna()
+    win = win.tail(HISTORY_ROWS)
+    if win.empty:
+        flags.append("нет истории для признаков серы")
+        return {}
+
+    feats = win
+    for col, lags in HISTORY_LAGS.items():
+        feats = add_lags(feats, [col], lags_h=lags)
+    for col, windows in HISTORY_ROLLING.items():
+        feats = add_rolling(feats, [col], windows_h=windows)
+    last = feats.iloc[-1]
+
+    age_min = (ts - feats.index[-1]).total_seconds() / 60.0
+    if age_min > TAG_STALE_MIN:
+        flags.append(f"признаки серы по истории устарели на {age_min / 60:.1f} ч")
+
+    names = [f"{c}__lag{h}h" for c, hs in HISTORY_LAGS.items() for h in hs]
+    names += [f"{c}__std{h}h" for c, hs in HISTORY_ROLLING.items() for h in hs]
+    return {n: float(last[n]) for n in names if pd.notna(last[n])}
 
 
 def _latest_lims(ts, lims_long: pd.DataFrame, flags: List[str]) -> Dict[str, Measurement]:
