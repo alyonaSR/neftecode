@@ -65,6 +65,26 @@ def test_compact_trace_keeps_the_audit_trail(tmp_path, monkeypatch):
     assert "checked" not in data["verdicts"][0]
 
 
+def test_report_separates_snapshot_time_from_report_time():
+    """
+    Момент среза процесса и момент расчёта это разные вещи. Одна дата в
+    шапке выдавала бы устаревший срез за свежую рекомендацию, а при разборе
+    истории наоборот прятала бы, что решение считалось по старым данным.
+    """
+    trace = _trace()
+    rec = trace.recommendation
+    assert rec.generated_at is not None
+
+    report = print_operator_report(rec, trace)
+    assert "состояние процесса на" in report
+    assert "отчёт сформирован" in report
+    # демо считает по мартовскому срезу, разрыв обязан быть назван вслух
+    assert "решение по историческим данным" in report
+
+    rec.generated_at = rec.ts + timedelta(minutes=5)      # нормальная работа
+    assert "решение по историческим данным" not in print_operator_report(rec, trace)
+
+
 def test_report_can_be_replayed_from_file(tmp_path, monkeypatch):
     import src.tracing as tracing
 
@@ -72,9 +92,14 @@ def test_report_can_be_replayed_from_file(tmp_path, monkeypatch):
     trace = _trace()
     data = load_trace(save_trace(trace, tag="replay"))
 
-    report = print_operator_report(recommendation_from_dict(data["recommendation"]))
+    restored = recommendation_from_dict(data["recommendation"])
+    report = print_operator_report(restored)
+
     assert "РЕКОМЕНДАЦИЯ ОПЕРАТОРУ" in report
     assert "ПРЕДЛАГАЕМОЕ ДЕЙСТВИЕ" in report
+    # обе даты переживают запись в файл и чтение обратно
+    assert restored.ts == trace.ts
+    assert restored.generated_at == trace.recommendation.generated_at
 
 
 def test_trace_from_newer_schema_still_opens(tmp_path, monkeypatch):

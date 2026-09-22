@@ -35,6 +35,7 @@ config/constraints.yaml, у которых source: spec. Сегодня тако
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .agents.model_monitor import ModelMonitorAgent
@@ -356,6 +357,7 @@ class Orchestrator:
             ),
             alternatives=[],
             data_freshness=summarize_freshness(state),
+            generated_at=datetime.now(),
         )
 
     def _rejection_summary(self, verdicts: List[GateVerdict]) -> str:
@@ -417,6 +419,7 @@ class Orchestrator:
             confidence=q.confidence,
             alternatives=self._alternatives(best, survivors, verdicts),
             data_freshness=summarize_freshness(state),
+            generated_at=datetime.now(),
         )
         rec.explanation = render_explanation(rec, q, r, best, v, len(survivors))
         return rec

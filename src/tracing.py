@@ -93,7 +93,9 @@ def recommendation_from_dict(data: Dict[str, Any]) -> Recommendation:
     """
     known = {f.name for f in fields(Recommendation)}
     kwargs = {k: v for k, v in data.items() if k in known}
-    kwargs["ts"] = datetime.fromisoformat(kwargs["ts"])
+    for key in ("ts", "generated_at"):
+        if isinstance(kwargs.get(key), str):
+            kwargs[key] = datetime.fromisoformat(kwargs[key])
     return Recommendation(**kwargs)
 
 

@@ -138,11 +138,7 @@ def print_operator_report(
     которых есть в самой рекомендации. С ним добавляются альтернативы
     с ценой выбора, допущения и обмен между агентами.
     """
-    lines: List[str] = [
-        "=" * WIDTH,
-        f"РЕКОМЕНДАЦИЯ ОПЕРАТОРУ   {rec.ts:%Y-%m-%d %H:%M}",
-        "=" * WIDTH,
-    ]
+    lines: List[str] = ["=" * WIDTH] + _header(rec) + ["=" * WIDTH]
 
     lines += _block_state(rec)
     lines += _block_problem(rec, trace)
@@ -157,6 +153,44 @@ def print_operator_report(
 
     lines.append("=" * WIDTH)
     return "\n".join(lines)
+
+
+# Расхождение между срезом и расчётом, после которого о нём стоит сказать
+# вслух: один цикл управления это 10 минут, получаса хватает на задержку
+# сбора данных, но не на устаревший срез.
+SNAPSHOT_LAG_MIN = 30.0
+
+
+def _header(rec: Recommendation) -> List[str]:
+    """
+    Две даты, а не одна.
+
+    Момент состояния и момент расчёта совпадают только в нормальной работе.
+    При разборе истории или сбое сбора данных они расходятся, и одна дата
+    в шапке выдавала бы устаревший срез за свежую рекомендацию.
+    """
+    if rec.generated_at is None:
+        return [f"РЕКОМЕНДАЦИЯ ОПЕРАТОРУ   {rec.ts:%Y-%m-%d %H:%M}"]
+
+    out = [
+        "РЕКОМЕНДАЦИЯ ОПЕРАТОРУ",
+        f"    состояние процесса на  {rec.ts:%Y-%m-%d %H:%M}",
+        f"    отчёт сформирован      {rec.generated_at:%Y-%m-%d %H:%M}",
+    ]
+
+    lag_min = (rec.generated_at - rec.ts).total_seconds() / 60.0
+    if lag_min > SNAPSHOT_LAG_MIN:
+        out.append(f"    срез старше расчёта на {_lag(lag_min)}: "
+                   "решение по историческим данным")
+    return out
+
+
+def _lag(minutes: float) -> str:
+    if minutes < 60:
+        return f"{minutes:.0f} мин"
+    if minutes < 48 * 60:
+        return f"{minutes / 60:.1f} ч"
+    return f"{minutes / 1440:.0f} сут"
 
 
 def _block_state(rec: Recommendation) -> List[str]:

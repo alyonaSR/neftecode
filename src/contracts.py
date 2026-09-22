@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-SCHEMA_VERSION = "1.5.0"
+SCHEMA_VERSION = "1.6.0"
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +265,13 @@ class Recommendation:
     чтобы отчёт печатался механически, а не сочинялся руками.
 
     action - словарь дельт ЛИБО строка 'REFUSE'
+
+    ts           - момент СОСТОЯНИЯ процесса, по которому принято решение
+    generated_at - момент, когда решение посчитано
+
+    Это разные вещи. В работе они расходятся на один цикл, при разборе
+    истории или сбое сбора данных - на сколько угодно. Оператор должен
+    видеть оба: иначе устаревший срез выглядит как свежая рекомендация.
     """
     ts: datetime
     action: Union[Dict[str, float], str]
@@ -282,6 +289,7 @@ class Recommendation:
     explanation: str = ""
     alternatives: List[Dict[str, Any]] = field(default_factory=list)
     data_freshness: Dict[str, Any] = field(default_factory=dict)
+    generated_at: Optional[datetime] = None
     schema_version: str = SCHEMA_VERSION
 
     @property

@@ -95,8 +95,17 @@ def run_question(question: str, scenario: str, orch: Orchestrator) -> None:
     trace = orch.run_cycle(build_demo_state(scenario))
     answer = ask(question, trace)
 
+    # Ответ относится к конкретному решению, поэтому решение печатается
+    # рядом с вопросом: иначе непонятно, о каком режиме речь.
+    rec = trace.recommendation
+    action = ("отказ от рекомендации" if rec.is_refusal else
+              ", ".join(f"{tag} {d:+.2f}" for tag, d in rec.action.items()
+                        if abs(d) > 1e-9) or "режим не менять")
+
     print("\n" + "=" * 78)
-    print(f"ВОПРОС ОПЕРАТОРА ({scenario}): {question}")
+    print(f"ВОПРОС ОПЕРАТОРА: {question}")
+    print(f"режим: {scenario}, состояние на {trace.ts:%Y-%m-%d %H:%M}")
+    print(f"решение системы: {action}")
     print("=" * 78)
     print(answer.text)
     print(f"\n[источник ответа: {answer.source}]", end="")
@@ -132,7 +141,6 @@ def replay(path: str = None) -> None:
 
 def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--scenario", choices=list(SCENARIOS), default=None)
     common.add_argument("--seed", type=int, default=42)
     common.add_argument(
         "--telemetry", action=argparse.BooleanOptionalAction, default=True,
@@ -144,10 +152,18 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
-    sub.add_parser("demo", parents=[common], help="сценарии раздела 6 ТЗ")
+    demo_parser = sub.add_parser("demo", parents=[common], help="сценарии раздела 6 ТЗ")
+    demo_parser.add_argument("--scenario", choices=list(SCENARIOS), default=None,
+                             help="один сценарий вместо всех трёх")
+
     ask_parser = sub.add_parser(
         "ask", parents=[common], help="вопрос по принятому решению"
     )
+    # Сценарий обязателен: ответ относится к конкретному решению, и раньше
+    # молчаливый выбор по умолчанию приводил к тому, что оператор получал
+    # ответ про режим, о котором не спрашивал.
+    ask_parser.add_argument("--scenario", choices=list(SCENARIOS), required=True,
+                            help="режим, о решении по которому идёт вопрос")
     ask_parser.add_argument("question", nargs="+", help="вопрос оператора")
 
     replay_parser = sub.add_parser("replay", help="отчёт из сохранённого трейса")
@@ -169,7 +185,7 @@ def main() -> None:
         warm_up_monitor(orch, telemetry)
 
     if args.command == "ask":
-        run_question(" ".join(args.question), args.scenario or "quality_risk", orch)
+        run_question(" ".join(args.question), args.scenario, orch)
         return
 
     # Агент самоконтроля - единственный, кто копит память между циклами.

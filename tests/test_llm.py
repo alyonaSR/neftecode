@@ -80,6 +80,38 @@ def test_model_answer_passes_through_when_numbers_check_out():
     assert "ДАННЫЕ" in client.calls[0][1]        # модель получила контекст решения
 
 
+def test_prompt_names_controllable_variables_explicitly():
+    """
+    Список управляемых переменных идёт отдельным блоком, а не только внутри
+    JSON. Пока он был спрятан в контексте, модель на вопрос про температуру
+    печи, которой система не управляет, отвечала про температуру реактора.
+    """
+    client = FakeClient("ответ")
+    ask("что будет, если прибавить жара в печь?", _trace(), client=client, cfg=ONLINE)
+
+    system, user = client.calls[0]
+    assert "УПРАВЛЯЕМЫЕ ПЕРЕМЕННЫЕ" in user
+    assert "242000:T5" in user.split("ДАННЫЕ")[0]      # до JSON, а не в нём
+    assert "НЕ ПОДМЕНЯЙ ПАРАМЕТРЫ" in system
+
+
+def test_ask_requires_explicit_scenario(monkeypatch):
+    """
+    Ответ относится к конкретному решению. Молчаливый режим по умолчанию
+    приводил к ответу про сценарий, о котором оператор не спрашивал.
+    Проверка упирается в разбор аргументов и до расчётов не доходит.
+    """
+    import run
+
+    monkeypatch.setattr(sys, "argv", ["run.py", "ask", "вопрос"])
+    try:
+        run.main()
+    except SystemExit as exit_code:
+        assert exit_code.code != 0
+    else:
+        raise AssertionError("ask без --scenario обязан завершиться ошибкой")
+
+
 def test_invented_number_is_flagged_not_hidden():
     """
     Тот же принцип, что у Gate: убедительность текста не даёт прав.
