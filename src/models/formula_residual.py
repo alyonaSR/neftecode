@@ -1,8 +1,6 @@
 """
 Обёртка "формула ВАК как baseline + LightGBM на остатках".
 
-Зона ответственности: Person 3 (ML Engineer).
-
 Общий паттерн soft-сенсора для всех показателей AVTModel и не-серных
 показателей GOModel: если для показателя есть формула ВАК, из неё
 берётся физически осмысленная опорная линия, и модель учится только на
@@ -17,11 +15,10 @@
   - один класс тестируется один раз, а не N раз на N показателей
 
 Интервал -- split conformal prediction с онлайн-адаптацией (Adaptive
-Conformal Inference), см. conformal.py. Stage 3 из research.pdf,
+Conformal Inference), см. conformal.py. Реализация из research.pdf,
 заменяет прежнюю эвристику "эмпирические 10/90 перцентили остатка без
 поправки на конечную выборку и без доказанной гарантии покрытия".
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -72,7 +69,7 @@ def _fit_shrink(pred, y, const: float) -> float:
 
 def _as_float_or_nan(v):
     """
-    Найдено Person 1 (прогон полного цикла, воспроизведено и подтверждено):
+    Найдено при прогоне полного цикла, воспроизведено и подтверждено:
     отсутствующий тег -> features.get(c) -> None -> колонка DataFrame
     получает dtype=object -> LightGBM.predict() падает с ValueError вместо
     штатной обработки пропуска. В реальной эксплуатации дырка в теге --
@@ -246,7 +243,7 @@ class FormulaPlusResidual:
 
         Не вызывается автоматически ни из какого продакшен-цикла --
         для этого нужен живой поток решений с обратной связью, это
-        зона Orchestrator (Person 1). Метод готов быть подключённым,
+        зона Orchestrator. Метод готов быть подключённым,
         покрыт tests/test_conformal.py.
         """
         if self._model is None or self._conformal is None:
@@ -274,7 +271,7 @@ class FormulaPlusResidual:
     def from_state(cls, state: dict, formula_fn, formula_tags, feature_cols,
                     monotone=None, fallback_mean: float = 0.0):
         """
-        БАГ, НАЙДЕН И ИСПРАВЛЕН (до Stage 3): cls(...) без fallback_mean
+        БАГ, НАЙДЕН И ИСПРАВЛЕН: cls(...) без fallback_mean
         тихо обнулял его (дефолт дата-класса 0.0), хотя вызывающая
         сторона (AVTModel.load / GOModel.load) прекрасно знает правильное
         значение из _SPECS. Для показателя без формулы и без обученного
@@ -284,7 +281,7 @@ class FormulaPlusResidual:
         честного "формула отсутствует, используем опорную константу".
         Это и роняло spec_risk_prob до 1.0 на demo-сценарии normal.
 
-        Артефакты, сохранённые ДО Stage 3, хранят resid_lo/resid_hi
+        Артефакты ранних версий хранят resid_lo/resid_hi
         (плоские числа) вместо conformal (state калибратора) -- строим
         ConformalResidualBounds из них как разовый откат, дальше
         используется честная калибровка при следующем переобучении.

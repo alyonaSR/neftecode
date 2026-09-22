@@ -1,5 +1,4 @@
 """Тесты слоя данных и агента надёжности. Тесты с данными пропускаются, если data/ пуста."""
-
 from __future__ import annotations
 
 from datetime import datetime

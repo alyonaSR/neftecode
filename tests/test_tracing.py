@@ -1,11 +1,9 @@
 """
 Тесты трейсов и контрактов.
 
-Зона ответственности: Person 1.
-
-Трейс — это доказательство критерия «Воспроизводимость» из ТЗ: по нему
+Трейс - это доказательство критерия «Воспроизводимость» из ТЗ: по нему
 через неделю должно быть понятно не только КАКОЕ решение принято, но и
-ЧЕМ оно получено — какой код, какие конфиги, какие модели.
+ЧЕМ оно получено - какой код, какие конфиги, какие модели.
 """
 import json
 import os
@@ -33,7 +31,7 @@ def test_trace_records_what_produced_the_result(tmp_path, monkeypatch):
     data = load_trace(save_trace(_trace(), tag="test"))
 
     meta = data["meta"]
-    assert meta["конфиги"]["constraints.yaml"]        # пороги — часть решения
+    assert meta["конфиги"]["constraints.yaml"]        # пороги - часть решения
     assert meta["модели"]
     assert meta["schema_version"] == data["schema_version"]
 
@@ -98,7 +96,7 @@ def test_trace_from_newer_schema_still_opens(tmp_path, monkeypatch):
 # ----------------------------------------------------------------------
 def test_two_source_policies_are_different_on_purpose():
     """
-    best_quality — приоритет достоверности (ЛИМС), freshest_usable —
+    best_quality - приоритет достоверности (ЛИМС), freshest_usable -
     приоритет свежести (ПАК). Для якоря по сере нужен свежий факт.
     """
     ts = datetime(2026, 3, 14, 8, 20)

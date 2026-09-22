@@ -1,10 +1,9 @@
 """
 Контекст решения для языковой модели.
 """
-
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from ..contracts import DecisionTrace
 from ..data.tags import manipulated_vars, quality_specs
@@ -18,6 +17,7 @@ def build_context(trace: DecisionTrace) -> Dict[str, Any]:
         "состояние": _state(trace),
         "оценка_качества": _quality(trace),
         "оценка_надёжности": _reliability(trace),
+        "самоконтроль_модели": _model_health(trace),
         "перебор_вариантов": _search(trace),
         "рекомендация": {
             "действие": "ОТКАЗ" if rec.is_refusal else rec.action,
@@ -77,11 +77,32 @@ def _reliability(trace: DecisionTrace) -> Dict[str, Any]:
     }
 
 
+def _model_health(trace: DecisionTrace) -> Optional[Dict[str, Any]]:
+    """
+    Самоконтроль прогноза: как часто интервал серы накрывал лабораторию.
+
+    Нужен модели, чтобы отвечать на «почему интервал стал шире» и «почему
+    отказ, если данные свежие»: это отдельная причина отказа, и без неё
+    помощник объяснил бы решение неверно.
+    """
+    health = getattr(trace, "model_health", None)
+    if health is None:
+        return None
+    return {
+        "статус": health.status,
+        "покрытие": health.coverage,
+        "сверок_с_лабораторией": health.n_obs,
+        "масштаб_интервала": health.scale,
+        "пояснение": health.message,
+        "последние_сверки": health.last_checks[-5:],
+    }
+
+
 def _search(trace: DecisionTrace) -> Dict[str, Any]:
     """
     Статистика перебора вместо списка кандидатов.
 
-    Оператор спрашивает "почему не сделали иначе" — для ответа нужно знать,
+    Оператор спрашивает "почему не сделали иначе" - для ответа нужно знать,
     сколько вариантов рассмотрено, сколько отброшено и ПО КАКОЙ причине,
     а не сами варианты.
     """
@@ -119,7 +140,7 @@ def _limits() -> Dict[str, Any]:
 
 
 def numbers_in(obj: Any) -> List[float]:
-    """Все числа контекста — белый список для проверки ответа модели."""
+    """Все числа контекста - белый список для проверки ответа модели."""
     out: List[float] = []
     _collect(obj, out)
     return out

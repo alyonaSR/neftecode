@@ -1,9 +1,9 @@
 """
-Split conformal prediction + Adaptive Conformal Inference (Stage 3).
+Split conformal prediction + Adaptive Conformal Inference.
 
-Зона ответственности: Person 3 (ML Engineer). Реализует то, что описано
+Реализует то, что описано
 в research.pdf ("Soft-сенсоры и гарантии безопасности через конформное
-прогнозирование") и было заявлено в README как TODO: "conformal
+прогнозирование") и было заявлено в README: "conformal
 prediction вместо эвристического интервала в QualityAgent".
 
 ЗАМЕНЯЕТ в FormulaPlusResidual эмпирические 10/90 перцентили остатка
@@ -31,7 +31,6 @@ prediction вместо эвристического интервала в Quali
 research.pdf (95%) и тем, чтобы не взорвать ширину интервала вдвое на
 старте; поднять до alpha=0.05 -- once-строчная правка при вызове fit().
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -116,9 +115,9 @@ class ConformalResidualBounds:
         периоды стабильной работы и расширять его при росте
         неопределённости" (research.pdf).
 
-        НЕ вызывается сегодня автоматически ни из какого продакшен-цикла
+        НЕ вызывается автоматически ни из какого продакшен-цикла
         -- для этого нужен живой поток решений с обратной связью по
-        новым анализам ЛИМС, а это авторизация Orchestrator (Person 1).
+        новым анализам ЛИМС, а это авторизация Orchestrator.
         Метод протестирован отдельно (tests/test_conformal.py) и готов
         быть подключённым, когда появится такой цикл.
         """

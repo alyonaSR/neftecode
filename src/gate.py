@@ -1,7 +1,6 @@
 """
 L3. Жёсткий фильтр.
 """
-
 from __future__ import annotations
 
 import math
@@ -55,7 +54,7 @@ class ConstraintGate:
 
         Для серы: hi, а не mean. Прогноз mean=9.1 при лимите 10 выглядит
         безопасно, но hi=10.4 означает реальный риск нарушения.
-        Проверка по mean — это ошибка, которая стоит всей задачи.
+        Проверка по mean - это ошибка, которая стоит всей задачи.
         """
         for param, spec in self.specs.items():
             hard = spec.get("source") == "spec"

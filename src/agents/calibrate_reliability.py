@@ -1,5 +1,4 @@
 """Калибровка агента надёжности. Запуск: python -m src.agents.calibrate_reliability"""
-
 from __future__ import annotations
 
 import os

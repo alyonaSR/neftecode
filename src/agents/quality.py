@@ -13,7 +13,6 @@ L1a. Агент качества.
 тем труднее удаляемая сера и тем более жёсткий режим нужен на ГО.
 Это и есть связанность цепочки из ТЗ, выраженная в коде.
 """
-
 from __future__ import annotations
 
 from typing import Dict, Optional
@@ -68,11 +67,15 @@ def fuse_anchor(readings, fallback: float, plausible=None) -> float:
 
 
 class QualityAgent:
-    """Заглушка с физически осмысленным поведением, чтобы цикл работал уже сегодня."""
-
+    """Оболочка над моделями АВТ и ГО: цепочка прогноза и доверие к нему."""
     def __init__(self, avt_model=None, go_model=None):
         self.avt = avt_model or load_default_avt()
         self.go = go_model or load_default_go()
+        # Множитель ширины интервала серы. Ставит агент самоконтроля по
+        # результатам сверки прошлых прогнозов с лабораторией: если модель
+        # промахивается чаще обещанного, интервал расширяется, и Gate
+        # перестаёт верить прогнозу больше, чем он стоит.
+        self.sulfur_scale = 1.0
         self.model_id = f"{self.avt.model_id}+{self.go.model_id}"
     def assess(
         self,
@@ -98,8 +101,8 @@ class QualityAgent:
 
     def _predict(self, state: ProcessState, deltas: Dict[str, float]) -> Dict[str, Interval]:
         """
-        Цепочка АВТ -> ГО. Обе модели вызываются ДВАЖДЫ — на текущем
-        режиме и на предлагаемом — разницу берёт вызывающий код, не
+        Цепочка АВТ -> ГО. Обе модели вызываются ДВАЖДЫ - на текущем
+        режиме и на предлагаемом - разницу берёт вызывающий код, не
         сама модель.
 
         """
@@ -168,6 +171,7 @@ class QualityAgent:
         if len(usable) == 2:
             half += abs(usable[0].value - usable[1].value)
         half += cfg["effect_uncertainty_share"] * abs(effect)
+        half *= getattr(self, "sulfur_scale", 1.0)
 
         level = fuse_anchor(
             [anchor.value] + _online_sulfur_readings(state),

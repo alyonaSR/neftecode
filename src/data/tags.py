@@ -1,7 +1,6 @@
 """
 Резолвер тегов и загрузка конфигов из config/*.yaml.
 """
-
 from __future__ import annotations
 
 import os

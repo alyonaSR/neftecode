@@ -1,5 +1,4 @@
 """Сборка ProcessState на момент ts и демо-состояния для сценариев ТЗ."""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta

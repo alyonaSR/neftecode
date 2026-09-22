@@ -4,19 +4,21 @@
 
     python run.py demo              все три сценария ТЗ
     python run.py demo --scenario quality_risk
-    python run.py demo --seed 42
+    python run.py demo --no-telemetry    быстро, без исторических рядов
 
     python run.py ask "почему не подняли температуру сильнее?"
     python run.py ask --scenario normal "почему ничего не меняем?"
 
 Воспроизводимость: seed фиксируется, трейсы пишутся в artifacts/traces/.
+Сценарии независимы друг от друга: перед каждым память агента самоконтроля
+возвращается в одно и то же состояние, см. main().
 Команда ask объясняет УЖЕ принятое решение и на него не влияет: без ключа
 языковой модели она отвечает шаблоном по тем же числам.
 """
-
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import os
 import random
@@ -53,15 +55,40 @@ def run_scenario(name: str, orch: Orchestrator) -> None:
 
 
 def load_demo_telemetry():
-    """Обе установки в одном кадре: агент надёжности смотрит и АВТ, и 24-2000."""
+    """
+    Обе установки в одном кадре: агент надёжности смотрит и АВТ, и 24-2000.
+
+    Возвращает None, если файлов нет. Данные организаторов в репозиторий не
+    коммитятся, поэтому на свежем клоне их не будет - демо обязано
+    запускаться и без них, просто с двумя факторами тяжести вместо пяти.
+    """
     import pandas as pd
 
     from src.data.loaders import load_telemetry
 
-    print("загрузка телеметрии из data/ ...")
-    frame = pd.concat([load_telemetry("AVT"), load_telemetry("242000")], axis=1)
+    try:
+        print("загрузка телеметрии из data/ ...")
+        frame = pd.concat([load_telemetry("AVT"), load_telemetry("242000")], axis=1)
+    except FileNotFoundError as e:
+        print(f"  телеметрии нет ({e.filename}), работаем без исторических рядов")
+        return None
+
     print(f"  {len(frame)} точек, {frame.index.min():%Y-%m-%d} .. {frame.index.max():%Y-%m-%d}")
     return frame
+
+
+def warm_up_monitor(orch: Orchestrator, telemetry) -> None:
+    """Прогрев агента самоконтроля на реальных анализах до момента демо."""
+    from src.data.loaders import load_lims, load_pak
+
+    until = build_demo_state("normal").ts
+    try:
+        n = orch.monitor.warm_up(orch.quality, telemetry, load_lims(), load_pak(), until)
+    except FileNotFoundError as e:
+        print(f"самоконтроль: нет данных для прогрева ({e.filename})")
+        return
+    print(f"самоконтроль: {n} сверок с лабораторией до {until:%Y-%m-%d %H:%M}, "
+          f"{orch.monitor.assess().message}")
 
 
 def run_question(question: str, scenario: str, orch: Orchestrator) -> None:
@@ -82,7 +109,7 @@ def run_question(question: str, scenario: str, orch: Orchestrator) -> None:
 
 def replay(path: str = None) -> None:
     """
-    Отчёт из сохранённого трейса. Воспроизводимость по ТЗ — это в том
+    Отчёт из сохранённого трейса. Воспроизводимость по ТЗ - это в том
     числе возможность показать решение недельной давности как есть,
     ничего не пересчитывая.
     """
@@ -108,10 +135,11 @@ def main() -> None:
     common.add_argument("--scenario", choices=list(SCENARIOS), default=None)
     common.add_argument("--seed", type=int, default=42)
     common.add_argument(
-        "--telemetry", action="store_true",
-        help="подгрузить исторические ряды из data/: агент надёжности "
-             "считает факторы со скользящим окном, без них работают "
-             "только два фактора из пяти",
+        "--telemetry", action=argparse.BooleanOptionalAction, default=True,
+        help="исторические ряды из data/ (по умолчанию включено): агент "
+             "надёжности считает все пять факторов вместо двух, агент "
+             "самоконтроля прогревается на последних анализах ЛИМС. "
+             "--no-telemetry для быстрого прогона без данных",
     )
 
     ap = argparse.ArgumentParser(description=__doc__)
@@ -124,7 +152,7 @@ def main() -> None:
 
     replay_parser = sub.add_parser("replay", help="отчёт из сохранённого трейса")
     replay_parser.add_argument("path", nargs="?", default=None,
-                               help="путь к трейсу; без аргумента — последний")
+                               help="путь к трейсу; без аргумента - последний")
 
     args = ap.parse_args()
 
@@ -135,13 +163,22 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    orch = Orchestrator(telemetry=load_demo_telemetry() if args.telemetry else None)
+    telemetry = load_demo_telemetry() if args.telemetry else None
+    orch = Orchestrator(telemetry=telemetry)
+    if telemetry is not None:
+        warm_up_monitor(orch, telemetry)
 
     if args.command == "ask":
         run_question(" ".join(args.question), args.scenario or "quality_risk", orch)
         return
 
+    # Агент самоконтроля - единственный, кто копит память между циклами.
+    # Сценарии ТЗ это не последовательность моментов, а три разных "что
+    # если" в один и тот же момент, поэтому каждый стартует с одной и той
+    # же прогретой памяти. Иначе результат зависел бы от порядка запуска.
+    warmed = copy.deepcopy(orch.monitor)
     for name in ([args.scenario] if args.scenario else SCENARIOS):
+        orch.monitor = copy.deepcopy(warmed)
         run_scenario(name, orch)
 
 

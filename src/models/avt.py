@@ -1,18 +1,14 @@
 """
 Модель установки АВТ.
 
-Зона ответственности: Person 3 (ML Engineer).
-
 ЦЕЛЕВАЯ ВЕЛИЧИНА ЦЕПОЧКИ: feed_ebp_c, конец кипения. T95 выбран НЕ был:
 формулы ВАК для AVT6:240-350 есть только на D15, T50, EBP и CFPP,
-а EBP и T95 сырья коррелируют на 0.91, то есть несут одно и то же
-(решение Person 1, подтверждено org-схемой: avt_diesel_t95_c на P&ID
-это тот же физический поток, что мы аппроксимируем через EBP).
+а EBP и T95 сырья коррелируют на 0.91, то есть несут одно и то же.
 
 ЧТО ПРЕДСКАЗЫВАЕТ: качество дизельной фракции, которая уходит с АВТ
 в гидроочистку (feed_ebp_c, feed_d15_kgm3, feed_cfpp_c, feed_flash_c).
 
-АРХИТЕКТУРА (после Stage 0/1, см. models/vak_formulas.py и
+АРХИТЕКТУРА (см. models/vak_formulas.py и
 models/formula_residual.py):
 
   Каждый показатель = формула ВАК (физически осмысленная опорная линия)
@@ -21,7 +17,7 @@ models/formula_residual.py):
 
   feed_ebp_c    <- AVT6:240-350:EBP
   feed_d15_kgm3 <- AVT6:240-350:D15  (НЕ AVT6:350:D15! У AVT6:350:D15 был
-                                       меньше RMSE в Stage 0 (6.3 против 13.7),
+                                       меньше RMSE при аудите формул (6.3 против 13.7),
                                        но это неправильный поток: "350" --
                                        это фракция ТЯЖЕЛЕЕ дизеля, не сырьё
                                        гидроочистки. Проверено на реальной
@@ -41,12 +37,11 @@ models/formula_residual.py):
 Признаки -- ТОЛЬКО текущий снимок (без лагов): ProcessState даёт только
 срез тегов на момент t (contracts.py), истории у agents/quality.py нет.
 Лаги нужны для серы (GOModel) и потребуют расширения ProcessState --
-это отдельный разговор с Person 1, не в рамках AVTModel.
+это требует расширения ProcessState и решается не здесь.
 
 ЧТО МОЖНО ВЗЯТЬ ГОТОВЫМ vs ЧЕГО В ВАК НЕТ -- см. vak_formulas.py,
 там же таблица со статусом каждой формулы после аудита по ЛИМС.
 """
-
 from __future__ import annotations
 
 from typing import Dict, Optional
@@ -98,10 +93,9 @@ class AVTModel(BaseQualityModel):
     показатель работает в режиме "только формула": предсказание точное
     там, где формула точна, интервал намеренно широкий (+-8), чтобы
     Gate не поверил непроверенному числу больше, чем оно того стоит.
-    Ровно так демо работает уже сегодня, без обучения -- это осознанное
+    Ровно так система работает и без обучения -- это осознанное
     свойство архитектуры, см. README ("никто никого не ждёт").
     """
-
     outputs = ["feed_ebp_c", "feed_d15_kgm3", "feed_cfpp_c", "feed_flash_c"]
     required_features = sorted({t for _, tags, extra, _ in _SPECS.values() for t in tags + extra})
     model_id = "avt_formula_residual_v3"
@@ -121,8 +115,8 @@ class AVTModel(BaseQualityModel):
 
     def fit(self, tables: Dict[str, "tuple"]) -> "AVTModel":
         """
-        TODO(Person 3, следующий шаг после первого обучения): вызывается
-        из scripts/train_avt.py, не напрямую. tables[output] = (X, y),
+        Вызывается из scripts/train_avt.py, не напрямую.
+         tables[output] = (X, y),
         где X -- DataFrame с DatetimeIndex и колонками required_features,
         y -- Series той же длины (значение ЛИМС, as-of присоединённое).
         """

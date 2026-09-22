@@ -1,15 +1,8 @@
 """
 Тесты агента оптимизации и отчёта по Парето-фронту.
 
-Зона ответственности: Person 4.
-
-ИСТОРИЯ ЭТОГО ФАЙЛА: терялся при слиянии веток уже дважды. Первый раз
-вместо него в tests/ оказалась случайная копия agents/pareto_report.py
-под чужим именем. Второй раз файл просто не попал в ветку, где Person 3
-подключила обученные модели. Если пропадёт третий раз — проверьте
-сначала `git log --oneline -- tests/test_optimizer.py`, а не пишите
-заново с нуля: тесты ниже фиксируют конкретные баги, которые уже были
-пойманы и исправлены, включая регрессионный тест на производительность.
+Тесты фиксируют конкретные баги, которые уже были пойманы и исправлены,
+включая регрессию на время полного цикла.
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,8 +33,8 @@ def test_default_active_vars_come_from_config_not_code():
     """
     РЕГРЕССИОННЫЙ ТЕСТ на баг Ксении: active_vars раньше был списком,
     зашитым прямо в propose(). Когда AVT:T33 убрали из constraints.yaml,
-    а из кода — нет, всё падало с KeyError у всей команды. Теперь
-    единственный источник истины — поле active: true в constraints.yaml.
+    а из кода - нет, всё падало с KeyError у всей команды. Теперь
+    единственный источник истины - поле active: true в constraints.yaml.
     """
     expected = {tag for tag, spec in manipulated_vars().items() if spec.get("active")}
     assert expected, "ни одна переменная не помечена active: true в constraints.yaml"
@@ -53,29 +46,29 @@ def test_default_active_vars_come_from_config_not_code():
 
 def test_grid_respects_current_real_operating_point():
     """
-    РЕГРЕССИОННЫЙ ТЕСТ на баг, который нашла Ксения: allowed_ranges
+    РЕГРЕССИОННЫЙ ТЕСТ: allowed_ranges
     строится из статического config/constraints.yaml, а не от текущего
     значения тега. Демо-состояние AVT:F30=128.4 (normal) и 141.0
-    (quality_risk) — если диапазон в constraints.yaml не накрывает эти
+    (quality_risk) - если диапазон в constraints.yaml не накрывает эти
     значения, _within_allowed() бракует вообще все кандидаты.
     """
     for scenario in ("normal", "quality_risk"):
         candidates = _propose(scenario)
         assert len(candidates) > 0, (
-            f"0 кандидатов на сценарии {scenario} — allowed_ranges снова "
+            f"0 кандидатов на сценарии {scenario} - allowed_ranges снова "
             "не накрывает текущее состояние установки"
         )
 
 
 def test_full_cycle_is_fast_enough_for_a_10_minute_step():
     """
-    РЕГРЕССИОННЫЙ ТЕСТ на находку этой сессии: после того как Person 3
-    подключила обученную модель (FormulaPlusResidual, pandas-индексация
+    РЕГРЕССИОННЫЙ ТЕСТ: после подключения
+    обученной модели (FormulaPlusResidual, pandas-индексация
     внутри predict_one), полный грид по T5/F30/F32 со старыми
-    grid_points 5/4/5 (1089 кандидатов) давал ~17с на один цикл — вся
+    grid_points 5/4/5 (1089 кандидатов) давал ~17с на один цикл - вся
     тестовая связка переставала укладываться в разумное время. ТЗ
     предполагает цикл принятия решения раз в 10 минут, не раз в 17
-    секунд ради одной рекомендации. Порог 5с — с большим запасом
+    секунд ради одной рекомендации. Порог 5с - с большим запасом
     от текущих ~1.5-2с, но ловит повторный разрастание сетки.
     """
     state = build_demo_state("quality_risk")
@@ -90,7 +83,7 @@ def test_full_cycle_is_fast_enough_for_a_10_minute_step():
     elapsed = time.time() - t0
 
     assert len(candidates) > 0
-    assert elapsed < 5.0, f"один цикл propose() занял {elapsed:.1f}с — сетка снова разрослась"
+    assert elapsed < 5.0, f"один цикл propose() занял {elapsed:.1f}с - сетка снова разрослась"
 
 
 def test_cost_proxy_does_not_double_count_yield():
@@ -107,7 +100,7 @@ def test_cost_proxy_charges_for_steam_if_f28_gets_activated():
 
 
 def test_yield_delta_sums_both_diesel_pool_tags():
-    """F30 и F32 вместе формируют объём дизельного пула (комментарий Person 1)."""
+    """F30 и F32 вместе формируют объём дизельного пула."""
     candidates = _propose()
     sample = next(
         c for c in candidates
@@ -137,9 +130,9 @@ def test_within_allowed_respects_reliability_ranges():
 def test_pareto_front_key_includes_yield_and_breaks_degenerate_ties():
     """
     РЕГРЕССИОННЫЙ ТЕСТ на находку коллеги: раньше ключ фронта был
-    (cost_proxy, severity_delta, sulfur_hi) — все три зависят только от
+    (cost_proxy, severity_delta, sulfur_hi) - все три зависят только от
     242000:T5, и варианты с одинаковой температурой, но разным отбором,
-    были неразличимы. Теперь -yield_delta — четвёртая ось: два кандидата
+    были неразличимы. Теперь -yield_delta - четвёртая ось: два кандидата
     с одинаковыми первыми тремя, но разным выпуском, не должны оба
     остаться во фронте как "одна и та же точка".
     """

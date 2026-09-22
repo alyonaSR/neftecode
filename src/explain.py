@@ -1,13 +1,12 @@
 """
 Сборка объяснения оператору.
 
-ЧТО ПОКАЗЫВАЕТ ОТЧЁТ. Блоки 1-7 — ровно таблица раздела 5 ТЗ. Блоки 8-10
+ЧТО ПОКАЗЫВАЕТ ОТЧЁТ. Блоки 1-7 - ровно таблица раздела 5 ТЗ. Блоки 8-10
 добавлены под критерии оценки: альтернативы с ценой выбора («чем выбранный
 вариант лучше»), явные допущения и обмен между агентами. Блоки 8-10 требуют DecisionTrace:
 в Recommendation этих данных нет и быть не должно, это ответ системы
 оператору, а не её внутренняя кухня.
 """
-
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -55,7 +54,7 @@ def _quality_items(expected_effect: Dict[str, Any]) -> Iterable[Tuple[str, Dict]
 
     Оркестратор кладёт туда по одной записи на каждую жёсткую спеку из
     конфига, поэтому здесь нет ни одного имени показателя: добавится
-    второй подтверждённый предел — отчёт напечатает его сам.
+    второй подтверждённый предел - отчёт напечатает его сам.
     """
     for name, effect in (expected_effect or {}).items():
         if isinstance(effect, dict) and "mean" in effect:
@@ -120,7 +119,7 @@ def render_explanation(rec, quality, reliability, candidate, verdict, n_survivor
         )
         parts.append(
             f"Допустимых альтернатив рассмотрено: {n_survivors}. "
-            "Правило выбора: при достаточном запасе — наименьшее "
+            "Правило выбора: при достаточном запасе - наименьшее "
             "воздействие, иначе наибольший запас."
         )
     parts.append(f"Доверие к прогнозу: {rec.confidence:.2f}.")
@@ -133,7 +132,7 @@ def print_operator_report(
     rec: Recommendation, trace: Optional[DecisionTrace] = None
 ) -> str:
     """
-    Отчёт в терминал. Блоки 1-7 — таблица раздела 5 ТЗ.
+    Отчёт в терминал. Блоки 1-7 - таблица раздела 5 ТЗ.
 
     trace необязателен: без него печатаются только те блоки, данные для
     которых есть в самой рекомендации. С ним добавляются альтернативы
@@ -256,8 +255,8 @@ def _block_effect(rec: Recommendation) -> List[str]:
         margin = effect.get("margin")
         verdict = ""
         if target is not None and margin is not None:
-            verdict = (" — запаса достаточно" if margin >= target
-                       else f" — ниже целевого {target}")
+            verdict = (" - запаса достаточно" if margin >= target
+                       else f" - ниже целевого {target}")
         out.append(f"    {effect.get('display', name)} ({name})")
         out += _labeled(
             "      ",
@@ -306,7 +305,7 @@ def _block_confidence(
     """
     level = ("высокая" if rec.confidence >= 0.75
              else "средняя" if rec.confidence >= 0.5 else "низкая")
-    out = ["\n[6] УВЕРЕННОСТЬ", f"    {rec.confidence:.2f} — {level}"]
+    out = ["\n[6] УВЕРЕННОСТЬ", f"    {rec.confidence:.2f} - {level}"]
 
     reasons = list(trace.quality.confidence_drivers) if trace else []
     if reasons:
@@ -314,6 +313,12 @@ def _block_confidence(
         out += [f"      - {r}" for r in reasons]
     elif rec.confidence >= 0.75:
         out.append("    данные свежие, источники исправны")
+
+    # Доверие к ДАННЫМ и доверие к МОДЕЛИ - разные вещи. Данные могут быть
+    # свежими, а прогноз при этом регулярно промахиваться мимо лаборатории.
+    health = getattr(trace, "model_health", None) if trace else None
+    if health is not None:
+        out += _labeled("    самоконтроль: ", health.message)
     return out
 
 

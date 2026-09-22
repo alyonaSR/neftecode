@@ -1,5 +1,4 @@
 """Тесты агента самоконтроля. Тест на истории пропускается, если data/ пуста."""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta

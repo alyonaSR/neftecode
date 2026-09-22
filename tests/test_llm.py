@@ -1,8 +1,6 @@
 """
 Тесты слоя языковой модели.
 
-Зона ответственности: Person 1.
-
 НИ ОДИН тест не ходит в сеть: модель подменяется заглушкой, а режим без
 модели проверяется явно. Иначе тесты падали бы на площадке без интернета,
 а вместе с ними и критерий воспроизводимости.
@@ -22,7 +20,6 @@ ONLINE = {"enabled": True, "verify_numbers": True, "strict": False}
 
 class FakeClient:
     """Заглушка модели: возвращает заранее заданный текст."""
-
     def __init__(self, text):
         self.text = text
         self.calls = []
@@ -42,7 +39,7 @@ def test_numbers_are_extracted_with_both_separators():
 
 
 def test_rounding_and_percent_are_not_hallucinations():
-    """Модель округляет 0.262 до 0.26 и пишет 29% вместо 0.291 — это те же числа."""
+    """Модель округляет 0.262 до 0.26 и пишет 29% вместо 0.291 - это те же числа."""
     allowed = [0.262, 0.291, 10.0]
     assert unknown_numbers("запас 0.26, риск 29%, лимит 10", allowed) == []
 
@@ -53,7 +50,7 @@ def test_invented_number_is_detected():
 
 # ----------------------------------------------------------------------
 def test_context_carries_decision_numbers():
-    """Модель имеет право ссылаться только на числа решения — они все здесь."""
+    """Модель имеет право ссылаться только на числа решения - они все здесь."""
     context = build_context(_trace())
     numbers = numbers_in(context)
 
@@ -102,7 +99,7 @@ def test_strict_mode_replaces_unverified_answer():
     answer = ask("что будет с серой?", _trace(), client=client, cfg=cfg)
 
     # Текст модели не показывается совсем; вместо него факты решения и
-    # причина отклонения, включая само выдуманное число — оператор должен
+    # причина отклонения, включая само выдуманное число - оператор должен
     # знать, что именно забраковано.
     assert answer.source == "шаблон"
     assert "Сера упадёт" not in answer.text
@@ -112,7 +109,7 @@ def test_strict_mode_replaces_unverified_answer():
 def test_llm_does_not_affect_the_decision():
     """
     Ключевое архитектурное свойство: рекомендация считается кодом.
-    Вопрос к модели её не меняет — иначе рушится воспроизводимость из ТЗ.
+    Вопрос к модели её не меняет - иначе рушится воспроизводимость из ТЗ.
     """
     trace = _trace()
     before = dict(trace.recommendation.action)

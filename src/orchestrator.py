@@ -21,23 +21,23 @@ L4. Оркестратор.
 Величина воздействия стоит выше тяжести и экономики сознательно: если
 запас уже достаточен, установку трогать не надо, и ТЗ прямо требует
 показать период, где лишних управляющих действий не создаётся.
-Если запаса не хватает, критерий (3) меняется на "больше запас" — см. _rank().
+Если запаса не хватает, критерий (3) меняется на "больше запас" - см. _rank().
 
 Экономика стоит последней сознательно. Ключевой принцип ТЗ:
 недопустимый режим нельзя компенсировать более высокой
 производительностью или меньшими затратами.
 
 ЖЁСТКИЕ СПЕКИ БЕРУТСЯ ИЗ КОНФИГА, не зашиты в код: это те показатели
-config/constraints.yaml, у которых source: spec. Сегодня такой один —
-сера. Появится второй подтверждённый предел — оркестратор менять
+config/constraints.yaml, у которых source: spec. Сегодня такой один -
+сера. Появится второй подтверждённый предел - оркестратор менять
 не придётся.
 """
-
 from __future__ import annotations
 
 import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from .agents.model_monitor import ModelMonitorAgent
 from .agents.optimizer import OptimizerAgent
 from .agents.quality import QualityAgent
 from .agents.reliability import ReliabilityAgent
@@ -68,11 +68,13 @@ class Orchestrator:
         optimizer: Optional[OptimizerAgent] = None,
         gate: Optional[ConstraintGate] = None,
         telemetry: Optional["pd.DataFrame"] = None,
+        monitor: Optional[ModelMonitorAgent] = None,
     ):
         self.quality = quality or QualityAgent()
         self.reliability = reliability or ReliabilityAgent(telemetry=telemetry)
         self.optimizer = optimizer or OptimizerAgent(self.quality)
         self.gate = gate or ConstraintGate()
+        self.monitor = monitor or ModelMonitorAgent()
 
         self.rules = refusal_rules()
         self.decision = load_config("constraints")["decision"]
@@ -81,13 +83,24 @@ class Orchestrator:
         self.soft_specs = {n: s for n, s in specs.items() if n not in self.hard_specs}
 
     def run_cycle(self, state: ProcessState) -> DecisionTrace:
+        # Порядок важен: сначала сверяем прошлые прогнозы с новым анализом
+        # ЛИМС и получаем масштаб интервала, потом считаем прогноз этим
+        # масштабом, и только потом запоминаем его для будущей сверки.
+        self.monitor.observe(state)
+        self.quality.sulfur_scale = self.monitor.scale
         q = self.quality.assess(state)
+        self.monitor.record(state, q)
+        health = self.monitor.assess()
         r = self.reliability.assess(state)
 
         candidates: List[Candidate] = []
         verdicts: List[GateVerdict] = []
 
         rec = self._data_refusal(state, q)
+        # Модель систематически промахивается мимо лаборатории - значит
+        # опираться на её прогноз нельзя, сколько бы ни был широк интервал.
+        if rec is None and health.status == "failed":
+            rec = self._refuse(state, q, health.message, [])
 
         if rec is None:
             candidates = self._drop_micro_moves(self.optimizer.propose(state, q, r))
@@ -110,7 +123,8 @@ class Orchestrator:
                     verdicts, baseline=self._baseline(candidates, verdicts),
                 )
 
-        return DecisionTrace(state.ts, state, q, r, candidates, verdicts, rec)
+        return DecisionTrace(state.ts, state, q, r, candidates, verdicts, rec,
+                             model_health=health)
 
     def _data_refusal(
         self, state: ProcessState, q: QualityAssess
@@ -118,7 +132,7 @@ class Orchestrator:
         """
         Отказ по данным наступает, когда по жёсткой спеке НЕ ОСТАЛОСЬ НИ
         ОДНОГО пригодного измерения. ТЗ задаёт приоритет источников
-        ЛИМС -> ПАК -> ВАК, то есть поточный анализатор — законный
+        ЛИМС -> ПАК -> ВАК, то есть поточный анализатор - законный
         источник, а не отсутствие данных: при живом свежем ПАК и
         устаревшем ЛИМС система обязана работать, просто с меньшим
         доверием (его считает QualityAgent).
@@ -173,7 +187,7 @@ class Orchestrator:
     def _drop_micro_moves(self, candidates: List[Candidate]) -> List[Candidate]:
         """
         action_deadband: движение меньше порога неотличимо от шума регулятора,
-        и предлагать его оператору — значит тратить его доверие впустую.
+        и предлагать его оператору - значит тратить его доверие впустую.
         """
         dead = float(self.decision["action_deadband"])
         mvars = manipulated_vars()
@@ -191,7 +205,7 @@ class Orchestrator:
         """
         Режим восстановления: текущий режим УЖЕ вне спецификации.
 
-        Gate прав, отбраковывая все варианты — спецификация не выполняется
+        Gate прав, отбраковывая все варианты - спецификация не выполняется
         ни в одном из них. Но отказ здесь означал бы, что система молчит
         ровно тогда, когда нужна: продукт уже вне спеки, а лучшее доступное
         действие существует и хуже не сделает. Поэтому допускаются
@@ -248,7 +262,7 @@ class Orchestrator:
         self, survivors: List[Candidate], verdicts: List[GateVerdict]
     ) -> List[Candidate]:
         """
-        Лексикографический выбор. Порядок критериев — это и есть политика системы.
+        Лексикографический выбор. Порядок критериев - это и есть политика системы.
 
         1) достаточен ли запас по жёстким спекам (бинарно)
         2) среди достаточных: МЕНЬШЕ ВОЗДЕЙСТВИЕ.
@@ -350,7 +364,7 @@ class Orchestrator:
 
         Оператору важны две вещи: какое ограничение оказалось узким местом
         и насколько близко было ближайшее решение. Перечислять нарушения
-        поштучно бессмысленно — их тысяча и они однотипные.
+        поштучно бессмысленно - их тысяча и они однотипные.
         """
         if not verdicts:
             return ""

@@ -2,10 +2,10 @@
 """
 Feature importance уже обученной GOModel -- что реально несёт
 предсказательную силу, а что нет, прежде чем ставить новые ML-эксперименты
-вслепую (см. hackathon_neftecode_ml_stage3 в памяти: АВТ-лаги и
+вслепую (АВТ-лаги и
 Аррениус-калибровка уже проверены и опровергнуты этим же методом мышления).
 
-Зона ответственности: Person 3. Ничего не меняет, только читает
+Ничего не меняет, только читает
 artifacts/models/go_v1.joblib (и avt_v1.joblib для полноты картины) и
 печатает встроенную важность признаков LightGBM (gain -- суммарный вклад
 в снижение ошибки; split -- сколько раз признак использован для сплита).
@@ -15,7 +15,6 @@ artifacts/models/go_v1.joblib (и avt_v1.joblib для полноты карти
 
     python scripts/audit_go_feature_importance.py
 """
-
 from __future__ import annotations
 
 import os

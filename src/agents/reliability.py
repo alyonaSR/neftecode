@@ -1,5 +1,4 @@
 """Агент надёжности: тяжесть режима и allowed_ranges для оптимизатора. Пороги в config/reliability.yaml."""
-
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -20,7 +19,6 @@ FACTOR_REPORT_PCTL = 0.85
 
 class ReliabilityAgent:
     """telemetry нужен для факторов со скользящим окном; срез всегда .loc[:ts]."""
-
     def __init__(
         self,
         telemetry: Optional[pd.DataFrame] = None,

@@ -2,7 +2,6 @@
 Клиент языковой модели.
 тонкая обёртка над HTTP API без внешних зависимостей
 """
-
 from __future__ import annotations
 
 import json
@@ -58,8 +57,7 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
 
 
 class GeminiClient:
-    """Вызов Gemini через REST. Единственный метод — complete()."""
-
+    """Вызов Gemini через REST. Единственный метод - complete()."""
     def __init__(self, api_key: str, cfg: Optional[dict] = None):
         cfg = cfg or load_config("llm")
         self.api_key = api_key
@@ -124,7 +122,7 @@ def load_client(cfg: Optional[dict] = None):
     """
     Готовый клиент либо None, если ключа нет.
 
-    None — нормальный режим работы, а не ошибка: демо и тесты
+    None - нормальный режим работы, а не ошибка: демо и тесты
     обязаны проходить на машине без ключа и без сети.
     """
     cfg = cfg or load_config("llm")

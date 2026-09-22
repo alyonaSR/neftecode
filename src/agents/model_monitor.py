@@ -1,5 +1,4 @@
 """Агент самоконтроля: сверяет интервал серы с лабораторией и подстраивает его ширину."""
-
 from __future__ import annotations
 
 from collections import deque
@@ -28,7 +27,6 @@ class ModelHealthAssess:
 
 class ModelMonitorAgent:
     """Хранит прогнозы серы и сверяет их с анализами ЛИМС."""
-
     def __init__(self, cfg: Optional[dict] = None):
         self.cfg = cfg or load_config("model_monitor")
         self.scale = 1.0

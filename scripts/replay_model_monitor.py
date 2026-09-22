@@ -1,5 +1,4 @@
 """Прогон агента самоконтроля по истории ЛИМС. Запуск: python -m scripts.replay_model_monitor"""
-
 from __future__ import annotations
 
 import os

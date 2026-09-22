@@ -1,5 +1,4 @@
 """Загрузка телеметрии, ЛИМС и ПАК."""
-
 from __future__ import annotations
 
 import os
