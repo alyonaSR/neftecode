@@ -13,11 +13,6 @@ from src.contracts import Interval
 from src.models import AVTModel, GOModel
 from src.models.base import monotone_vector
 
-# Медианы по очищенной истории 2023-2026 (см. src/data/state_builder.py,
-# те же значения). Формулы ВАК работают на абсолютных тегах, не на
-# приращениях -- untrained AVTModel без полного набора входов формулу
-# не считает (formula_residual.baseline() ловит KeyError и отдаёт 0.0),
-# поэтому тесты знаков дают полный вектор признаков.
 AVT_BASE = {
     "AVT:F30": 127.91, "AVT:T33": 338.24, "AVT:F36": 131.32,
     "AVT:T37": 60.9, "AVT:T40": 177.61, "AVT:T58": 58.32,
@@ -56,19 +51,9 @@ def test_avt_more_diesel_draw_means_heavier_tail():
         return
     low = m.predict({**AVT_BASE, "AVT:F30": 110.0})["feed_ebp_c"].mean
     high = m.predict({**AVT_BASE, "AVT:F30": 150.0})["feed_ebp_c"].mean
-    # >=, не >: monotone_constraints гарантируют неубывание, не строгий рост
     assert high >= low
 
 
-# Stage 2: GOModel больше не работает через anchor+дельты (см. докстринг
-# go.py -- обучающих примеров "что было бы при таком-то Δ" в истории нет).
-# Вход теперь абсолютный: сырые теги 24-2000 (в т.ч. предпосчитанные
-# лаг/волатильность-ключи) + выход AVTModel.
-#
-# catalyst_age_days убран из sulfur_mgkg (эксперимент 2,
-# scripts/experiments_sulfur.py, см. память hackathon_neftecode_ml_stage3):
-# буквально функция календарного времени, главный подозреваемый в переносе
-# temporal drift между train- и calib-частью сплита.
 GO_BASE = {
     "242000:T5": 370.4, "242000:T5__lag3h": 366.4, "242000:T5__lag6h": 367.8,
     "242000:T5__std3h": 1.95, "242000:T5__std6h": 1.68,
@@ -139,8 +124,6 @@ def test_go_heavier_feed_means_more_sulfur():
         return
     light = m.predict({**GO_BASE, "feed_ebp_c": 355.0})["sulfur_mgkg"].mean
     heavy = m.predict({**GO_BASE, "feed_ebp_c": 385.0})["sulfur_mgkg"].mean
-    # >=, не >: см. комментарий в test_chain_avt_output_feeds_go_input --
-    # monotone_constraints гарантирует неубывание, не строгий рост.
     assert heavy >= light
 
 
@@ -186,10 +169,8 @@ def test_derived_features_are_computed_from_raw_tags():
     assert d["242000:h2_oil_ratio"] == 22000.0 / 190.0
     assert 0.0 < d["242000:arrhenius_t5"] < 1.0
     assert d["242000:q20_x_arrhenius"] == 9500.0 * d["242000:arrhenius_t5"]
-    # уже посчитанное вызывающим кодом не перетирается
     assert GOModel.derive_features({**raw, "242000:h2_oil_ratio": 1.0})[
         "242000:h2_oil_ratio"] == 1.0
-    # отсутствующее сырьё не роняет
     GOModel.derive_features({"242000:T5": 370.0})
 
 
@@ -216,7 +197,6 @@ def test_no_formula_plus_trained_residual_does_not_double_count_level():
 
     m = FormulaPlusResidual(name="t", formula_fn=None, formula_tags=[],
                             feature_cols=["a", "b"], fallback_mean=365.0)
-    # без обучения -- работает опорная константа, а не 0.0
     assert m.predict_one({"a": 10.0, "b": 5.0}).mean == 365.0
 
     m.fit(X, y)
@@ -272,9 +252,6 @@ def test_chain_avt_output_feeds_go_input():
 
     s_a = go.predict({**GO_BASE, "feed_ebp_c": a["feed_ebp_c"].mean})["sulfur_mgkg"].mean
     s_b = go.predict({**GO_BASE, "feed_ebp_c": b["feed_ebp_c"].mean})["sulfur_mgkg"].mean
-    # >=, не >: monotone_constraints гарантирует НЕубывание, не строгий
-    # рост -- если обе точки попали в один лист дерева, s_a == s_b точно
-    # (наблюдалось после ретрейна), и это не нарушение монотонности.
     assert s_b >= s_a
 
 

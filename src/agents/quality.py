@@ -26,16 +26,17 @@ from ..models import load_default_avt, load_default_go
 from ..models.features import catalyst_age_days_scalar
 
 
-# Поточные анализаторы серы продукта. state.pak приходит из файла ПАК,
-# а 242000:Q21 -- отдельный тег телеметрии. ЭТО РАЗНЫЕ РЯДЫ, а не копии
-# одного: corr(ПАК-файл, Q21) = 0.412, RMSE между ними 3.07, совпадают
-# 0.9% значений (замер 2026-09-22). Оба меряют серу ГОДТ, оба шумят,
-# поэтому их стоит усреднять, а не выбирать один.
 _ONLINE_SULFUR_TAGS = ("242000:Q21",)
 
 
 def _online_sulfur_readings(state: ProcessState) -> list:
-    """Показания поточных анализаторов серы, лежащие в телеметрии."""
+    """
+    Показания поточных анализаторов серы из телеметрии.
+
+    state.pak приходит из файла ПАК, а 242000:Q21 -- отдельный тег.
+    Это РАЗНЫЕ ряды: corr 0.412, RMSE между ними 3.07, совпадают 0.9%
+    значений. Оба меряют серу ГОДТ, оба шумят, поэтому усредняются.
+    """
     out = []
     for tag in _ONLINE_SULFUR_TAGS:
         v = state.tags.get(tag)
@@ -48,23 +49,14 @@ def fuse_anchor(readings, fallback: float, plausible=None) -> float:
     """
     Уровень серы "сейчас" по нескольким приборам сразу.
 
-    Два правила, оба подтверждены замером (walk-forward, 5 блоков,
-    сравнение с константой = среднее обучающей выборки):
+    Два правила, оба подтверждены замером против константы:
+    усреднять приборы (по отдельности ни один константу не бьёт:
+    -8.0% и -27.0%) и отбрасывать неправдоподобные показания. Без
+    второго шага усреднение не даёт ничего (+0.0%), с ним -- +11.6%.
 
-      1. УСРЕДНЯТЬ, а не выбирать один прибор. По отдельности ни один
-         константу не бьёт: ПАК-файл -8.0%, Q21 -27.0%.
-      2. ОТБРАСЫВАТЬ неправдоподобные показания, заменяя их остальными
-         приборами, а при их отсутствии -- прогнозом модели. Без этого
-         шага усреднение не даёт ничего (+0.0%), с ним -- +11.6%
-         (RMSE 1.986 -> 1.756, лучше константы в 3 блоках из 5, в
-         остальных двух ничья).
-
-    Почему шаг 2 решает так много: вне диапазона оказывается всего
-    1.7% показаний ПАК-файла и 2.7% Q21, но ошибка входит в RMSE в
-    КВАДРАТЕ, и эти единицы процентов несут основную её часть. Ровно на
-    этом я сама ошиблась 2026-09-22: отфильтровала такие точки ИЗ ОЦЕНКИ
-    и получила завышенное качество прибора (1.589 вместо 2.575). В
-    проде отбрасывать пробу нельзя -- показание надо ЗАМЕНИТЬ.
+    Вне диапазона всего 1.7% показаний ПАК и 2.7% Q21, но ошибка входит
+    в RMSE в КВАДРАТЕ, и эти проценты несут её основную часть. Показание
+    ЗАМЕНЯЕТСЯ, а не удаляется: в проде пробу выбросить нельзя.
     """
     vals = [float(v) for v in readings if v is not None and np.isfinite(v)]
     if plausible:
@@ -79,16 +71,9 @@ class QualityAgent:
     """Заглушка с физически осмысленным поведением, чтобы цикл работал уже сегодня."""
 
     def __init__(self, avt_model=None, go_model=None):
-        # Person 3: подмена на обученные модели, если артефакты в
-        # artifacts/models/ есть (load_default_* сами проверяют файл и
-        # откатываются на formula-only, если его нет -- см. models/loading.py).
-        # Сигнатура predict(features) -> dict[str, Interval] не меняется,
-        # поэтому подмена не затрагивает ни один другой слой.
         self.avt = avt_model or load_default_avt()
         self.go = go_model or load_default_go()
         self.model_id = f"{self.avt.model_id}+{self.go.model_id}"
-
-    # ------------------------------------------------------------------
     def assess(
         self,
         state: ProcessState,
@@ -118,15 +103,10 @@ class QualityAgent:
         сама модель.
 
         """
-        # 1. текущий режим АВТ
         f_now = {t: state.tag(t) for t in self.avt.required_features}
         avt_now = self.avt.predict({k: v for k, v in f_now.items() if v is not None})
-
-        # 2. режим АВТ после предлагаемого изменения
         f_new = {t: (v + deltas.get(t, 0.0)) for t, v in f_now.items() if v is not None}
         avt_new = self.avt.predict(f_new)
-
-        # 3. гидроочистка: сырые теги 24-2000
         go_raw_now = {t: state.tag(t) for t in self.go.required_features
                       if t.startswith("242000:")}
         go_raw_now["catalyst_age_days"] = catalyst_age_days_scalar(state.ts)
@@ -149,11 +129,6 @@ class QualityAgent:
             k: go_new[k].mean - go_now[k].mean for k in go_new
         }
 
-        # H-L1 (2026-09-22): эффект по сере берётся ИЗ ФОРМУЛЫ, а не как
-        # разница двух полных прогнозов. ML-остаток переворачивает знак
-        # отклика на температуру (+0.197 вместо -0.254 мг/кг на +2 C,
-        # неверный знак у 59.4% точек) -- подробности в GOModel.predict_effect
-        # и SULFUR_HYPOTHESES.md. Уровень по-прежнему из свежего замера.
         sulfur_effect = self.go.predict_effect(
             go_features(avt_now, go_raw_now), go_features(avt_new, go_raw_new)
         )["sulfur_mgkg"]
@@ -168,6 +143,15 @@ class QualityAgent:
         self, state: ProcessState, now_iv: Interval, new_iv: Interval,
         effect: Optional[float] = None,
     ) -> Interval:
+        """
+        Прогноз серы для кандидата: уровень сейчас плюс эффект действия.
+
+        Уровень берётся из показаний приборов, эффект -- из физической
+        формулы (см. GOModel.predict_effect): ML-остаток переворачивает
+        знак отклика на температуру, давая +0.197 вместо -0.254 мг/кг
+        на +2 C. effect=None оставляет прежнее поведение -- разницу
+        двух полных прогнозов.
+        """
         cfg = load_config("constraints")["sulfur_anchor"]
         max_age = refusal_rules()["max_lims_age_min"]
         usable = state.usable_sources("sulfur_mgkg", max_age)
@@ -175,8 +159,6 @@ class QualityAgent:
             return new_iv
 
         anchor = state.freshest_usable("sulfur_mgkg", max_age)
-        # effect=None -- прежнее поведение (разница полных прогнозов);
-        # вызывающий код передаёт формульный эффект, см. H-L1 выше.
         if effect is None:
             effect = new_iv.mean - now_iv.mean
         horizon_min = cfg["cycle_min"] + anchor.age_min
@@ -243,7 +225,6 @@ class QualityAgent:
 
     def _drivers(self, state: ProcessState, deltas: Dict[str, float]) -> list:
         out = []
-        # пороги = p75 и p25 по очищенной истории, см. config/constraints.yaml
         f30 = state.tag("AVT:F30")
         if f30 and f30 > 140.0:
             out.append(f"высокий отбор дизельной фракции AVT:F30={f30:.1f} т/ч, хвост тяжелее")

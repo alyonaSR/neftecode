@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Набор экспериментов по серной модели GOModel -- отвечает на вопрос
 "что ещё реально стоит попробовать, прежде чем сдавать эту часть".
@@ -50,9 +49,6 @@ from src.models.formula_residual import FormulaPlusResidual
 ARTIFACTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "artifacts", "models")
 SULFUR_OUTLIER_THRESHOLD = 20.0
-# Источник правды -- go.py._SPECS, не дублируем список руками (дублирование
-# и разъехалось в прошлый раз: этот файл не знал о 242000:Q20, добавленной
-# в go.py 2026-09-19, что уронило evaluate_model_quality.py KeyError).
 SULFUR_FEATURES = GO_SPECS["sulfur_mgkg"][1]
 
 
@@ -405,7 +401,6 @@ def experiment_8_normalized_conformal(table: pd.DataFrame, lims: pd.DataFrame):
     def predict_mean(df):
         return base_of(df) + mean_model.predict(df[SULFUR_FEATURES].rename(columns=safe))
 
-    # sigma-модель на |остаток| обучающей части
     resid_tr = (tr["y"] - predict_mean(tr)).abs()
     sigma_model = lgb.LGBMRegressor(n_estimators=100, max_depth=3, learning_rate=0.05,
                                      num_leaves=7, min_child_samples=max(5, len(tr) // 30),
@@ -414,16 +409,14 @@ def experiment_8_normalized_conformal(table: pd.DataFrame, lims: pd.DataFrame):
 
     def sigma_of(df):
         s = sigma_model.predict(df[SULFUR_FEATURES].rename(columns=safe))
-        return np.clip(s, 0.2, None)  # пол, чтобы не делить на ~0
+        return np.clip(s, 0.2, None)
 
     err_ca = (ca["y"] - predict_mean(ca)).values
     alpha = 0.10
 
-    # (1) глобальный конформный -- как сейчас в проде
     q_hi_g = finite_sample_quantile(err_ca, alpha)
     q_lo_g = finite_sample_quantile(-err_ca, alpha)
 
-    # (2) нормализованный
     s_ca = sigma_of(ca)
     q_hi_n = finite_sample_quantile(err_ca / s_ca, alpha)
     q_lo_n = finite_sample_quantile(-err_ca / s_ca, alpha)
@@ -435,7 +428,6 @@ def experiment_8_normalized_conformal(table: pd.DataFrame, lims: pd.DataFrame):
     def report(label, lo, hi):
         cov_hi = float(np.mean(y_te <= hi))
         width = float(np.mean(hi - lo))
-        # спокойные vs турбулентные -- по волатильности T5 за 6ч
         vol = te["242000:T5__std6h"].values
         calm = vol <= np.quantile(vol, 0.33)
         turb = vol >= np.quantile(vol, 0.67)
@@ -475,7 +467,7 @@ def experiment_9_log_target(table: pd.DataFrame, lims: pd.DataFrame):
                           direction="backward", tolerance=pd.Timedelta(hours=1)).dropna()
     tbl = table.loc[link["ts"].values].copy()
     tbl["_lims_ts"] = link["lims_ts"].values
-    tbl = tbl[tbl["y"] > 0.05]  # ln нужен положительный аргумент
+    tbl = tbl[tbl["y"] > 0.05]
 
     samples = np.sort(tbl["_lims_ts"].unique())
     s_train, s_calib = samples[int(len(samples) * 0.70)], samples[int(len(samples) * 0.85)]
@@ -500,7 +492,7 @@ def experiment_9_log_target(table: pd.DataFrame, lims: pd.DataFrame):
         rmse = float(np.sqrt(((pred_te - y) ** 2).mean()))
         cov = float(np.mean(y <= hi_te))
         width = hi_te - lo_te
-        near = (pred_te >= 8.0) & (pred_te <= 10.0)   # зона, где Gate решает
+        near = (pred_te >= 8.0) & (pred_te <= 10.0)
         print(f"  {label}")
         print(f"    RMSE={rmse:.3f}  покрытие по hi={cov:.3f}  средняя ширина={width.mean():.2f}")
         if near.sum() >= 20:
@@ -509,7 +501,6 @@ def experiment_9_log_target(table: pd.DataFrame, lims: pd.DataFrame):
         else:
             print(f"    В зоне 8-10 мг/кг точек мало (n={int(near.sum())})")
 
-    # --- A: как сейчас, линейная цель ---
     m_lin = make_model(len(tr))
     m_lin.fit(tr[SULFUR_FEATURES].rename(columns=safe), tr["y"] - base_of(tr))
     pred_ca = (base_of(ca) + m_lin.predict(ca[SULFUR_FEATURES].rename(columns=safe))).values
@@ -519,7 +510,6 @@ def experiment_9_log_target(table: pd.DataFrame, lims: pd.DataFrame):
     pred_te = (base_of(te) + m_lin.predict(te[SULFUR_FEATURES].rename(columns=safe))).values
     evaluate("A: линейная цель (как сейчас)", pred_te, pred_te - q_lo, pred_te + q_hi)
 
-    # --- B: логарифмическая цель ---
     m_log = make_model(len(tr))
     m_log.fit(tr[SULFUR_FEATURES].rename(columns=safe),
               np.log(tr["y"].values) - np.log(base_of(tr).values))
@@ -634,11 +624,9 @@ def experiment_11_q21_go_no_go(table: pd.DataFrame, tel_go: pd.DataFrame, lims: 
     samples = np.sort(tbl["_lims_ts"].unique())
     s_cut = samples[int(len(samples) * 0.85)]
     dev_lims = tbl[tbl["_lims_ts"] < s_cut]
-    te = tbl[tbl["_lims_ts"] >= s_cut]           # ЛИМС-holdout, общий для обоих
+    te = tbl[tbl["_lims_ts"] >= s_cut]
     te_start = te.index.min()
 
-    # Q21 как метка: берём те же признаки, но y = показание ПАК, и СТРОГО
-    # раньше начала ЛИМС-holdout, иначе сравнение нечестное
     q21 = tel_go[["242000:Q21"]].dropna()
     q_tbl = table.join(q21, how="inner")
     q_tbl = q_tbl[(q_tbl.index < te_start) & (q_tbl["242000:Q21"] <= SULFUR_OUTLIER_THRESHOLD)]
@@ -785,7 +773,6 @@ def experiment_13_three_cornered_hat(table: pd.DataFrame, tel_go: pd.DataFrame, 
     samples = np.sort(tbl["_lims_ts"].unique())
     bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
 
-    # --- C: честный прогноз вне выборки для второй половины проб ---
     blocks = []
     for i in range(5):
         lo_i, hi_i = bounds[i], bounds[i + 1]
@@ -810,7 +797,6 @@ def experiment_13_three_cornered_hat(table: pd.DataFrame, tel_go: pd.DataFrame, 
     per = oos.groupby("_lims_ts").agg(A=("A", "first"), C=("C", "mean")).reset_index()
     per = per.rename(columns={"_lims_ts": "ts"}).sort_values("ts")
 
-    # --- B: показание поточного анализатора Q21, ближайшее к отбору пробы ---
     q = tel_go[["242000:Q21"]].dropna().sort_index()
     stuck = q["242000:Q21"].rolling("6h").std().fillna(0.0)
     qdf = pd.DataFrame({"ts": q.index, "B": q["242000:Q21"].values,
@@ -821,8 +807,6 @@ def experiment_13_three_cornered_hat(table: pd.DataFrame, tel_go: pd.DataFrame, 
 
     def grubbs(df, label):
         A, B, C = df["A"].values, df["B"].values, df["C"].values
-        # дисперсии РАЗНОСТЕЙ (центрированные): систематический сдвиг между
-        # приборами -- это калибровка, а не шум, его выносим отдельно
         v_ab = float(np.var(A - B, ddof=1))
         v_ac = float(np.var(A - C, ddof=1))
         v_bc = float(np.var(B - C, ddof=1))
@@ -1011,7 +995,6 @@ def experiment_15_baseline_choice(table: pd.DataFrame, lims: pd.DataFrame):
         Xte = te[SULFUR_FEATURES].rename(columns=safe)
         f_tr, f_te = formula(tr), formula(te)
         const = float(y_tr.mean())
-        # линейная перекалибровка формулы на трейне
         b, a = np.polyfit(f_tr.values, y_tr.values, 1)
         rc_tr, rc_te = a + b * f_tr, a + b * f_te
 
@@ -1093,7 +1076,6 @@ def experiment_16_capacity_and_dedup(table: pd.DataFrame, lims: pd.DataFrame):
     samples = np.sort(tbl["_lims_ts"].unique())
     bounds = np.linspace(int(len(samples) * 0.5), len(samples), 6).astype(int)
 
-    # (mcs_divisor, max_depth, num_leaves, дедуплицировать?)
     cfgs = [("прод: mcs=n/50, d4", 50, 4, 15, False),
             ("mcs=n/150, d4",     150, 4, 15, False),
             ("mcs=n/300, d6",     300, 6, 31, False),
@@ -1202,7 +1184,7 @@ def experiment_17_gate_decision_matrix(table_full: pd.DataFrame, lims: pd.DataFr
         te = tbl[(tbl["_lims_ts"] >= cut_lo) & (tbl["_lims_ts"] <= cut_hi)]
         if len(tr) < 200 or len(te) < 20:
             continue
-        tr_fit = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]      # как в проде
+        tr_fit = tr[tr["y"] <= SULFUR_OUTLIER_THRESHOLD]
 
         sub = FormulaPlusResidual(name="sulfur_mgkg", formula_fn=spec[0],
                                    formula_tags=spec[1], feature_cols=spec[1],
@@ -1210,7 +1192,6 @@ def experiment_17_gate_decision_matrix(table_full: pd.DataFrame, lims: pd.DataFr
                                    monotone=monotone_vector(spec[1], "sulfur_mgkg"))
         sub.fit(tr_fit[SULFUR_FEATURES], tr_fit["y"])
 
-        # константный "прогноз" + конформный интервал по той же калибровке
         n_tr = len(tr_fit)
         c_cut = int(n_tr * 0.8)
         const = float(tr_fit["y"].iloc[:c_cut].mean())
@@ -1341,8 +1322,6 @@ def experiment_18_discrimination_auc(table_full: pd.DataFrame, tel_go: pd.DataFr
     ideal = [auc(y + rng.normal(0, 1.16, len(y)), lab) for _ in range(200)]
     print(f"  {'идеальный прибор (потолок)':<28}{np.mean(ideal):>8.3f}")
 
-    # Контроль: не тянут ли AUC вниз экстремальные выбросы (y > 20), которых
-    # модель при обучении не видела (они отфильтрованы как в проде).
     mild = d[d["y"] <= SULFUR_OUTLIER_THRESHOLD]
     n_hard = int((d["y"] > SULFUR_OUTLIER_THRESHOLD).sum())
     print(f"\n  контроль: из {int(lab.sum())} внеспековых {n_hard} -- это y > 20 "

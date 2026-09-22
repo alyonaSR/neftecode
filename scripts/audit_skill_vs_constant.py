@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Skill score всех целей против ТРИВИАЛЬНОЙ базы -- константы.
 
@@ -40,7 +39,7 @@ from src.models.go import _SPECS as GO_SPECS
 from src.models.base import monotone_vector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_avt import build_table as build_avt_table  # noqa: E402
+from train_avt import build_table as build_avt_table
 
 ARTIFACTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "artifacts", "models")
@@ -110,9 +109,6 @@ def main():
     print("\n  --- AVTModel ---")
     for out, (fn, tags, extra, fb) in AVT_SPECS.items():
         feature_cols = list(tags) + list(extra)
-        # точку отбора ЛИМС выбираем ФОРМУЛОЙ (она это делает верно),
-        # а как baseline берём то, что реально стоит в проде -- см.
-        # avt._NO_FORMULA_BASELINE (H-O2: у feed_ebp_c формула вредит).
         t = build_avt_table(out, fn, list(tags), feature_cols, tel_avt, lims, points)
         if t is None:
             continue
@@ -121,14 +117,13 @@ def main():
 
     print("\n  --- GOModel ---")
     avt = AVTModel.load(os.path.join(ARTIFACTS, "avt_v1.joblib"))
-    from experiments_sulfur import build_sulfur_table  # noqa: E402
+    from experiments_sulfur import build_sulfur_table
     table, _ = build_sulfur_table(avt, tel_avt, tel_go, lims, feed_delay_h=0.0)
     table = table.loc[table.index.sort_values()]
     fn, tags, fb = GO_SPECS["sulfur_mgkg"]
     walk_forward_skill(table[tags], table["y"], (fn, tags, tags, fb),
                         "sulfur_mgkg", monotone_target="sulfur_mgkg")
 
-    # flash_c и cfpp_c: те же таблицы, что строит train_go.py
     for out in ("flash_c", "cfpp_c"):
         fn, tags, fb = GO_SPECS[out]
         sub = lims[lims["param"] == out][["ts", "sample_point", "value"]].dropna()
