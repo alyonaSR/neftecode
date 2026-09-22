@@ -22,7 +22,11 @@ import numpy as np
 from ..contracts import Interval, ProcessState, QualityAssess
 from ..data.tags import load_config, quality_specs, refusal_rules
 from ..models import load_default_avt, load_default_go
-from ..models.features import catalyst_age_days_scalar
+from ..models.features import (
+    GO_INSTANT_BASE,
+    catalyst_age_days_scalar,
+    go_instant_features,
+)
 
 
 _ONLINE_SULFUR_TAGS = ("242000:Q21",)
@@ -116,6 +120,17 @@ class QualityAgent:
         go_raw_now = {k: v for k, v in go_raw_now.items() if v is not None}
 
         go_raw_new = {t: (v + deltas.get(t, 0.0)) for t, v in go_raw_now.items()}
+
+        # Мгновенные признаки серы (квенч-дельта, водород/сырьё, член
+        # Аррениуса) считаются ПОСЛЕ применения изменений режима.
+        # Формула одна и та же при обучении и в работе: models/features.
+        # GOModel.derive_features() умеет вывести их сам, но тогда обучение
+        # и рабочий цикл считали бы их по двум разным копиям кода.
+        base_now = {t: state.tag(t) for t in GO_INSTANT_BASE}
+        base_new = {t: None if v is None else v + deltas.get(t, 0.0)
+                    for t, v in base_now.items()}
+        go_raw_now.update(go_instant_features(base_now))
+        go_raw_new.update(go_instant_features(base_new))
 
         def go_features(avt_out, go_raw):
             return {

@@ -259,3 +259,28 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn(); print(f"  OK  {name}")
     print("\nвсе тесты моделей прошли")
+
+
+def test_go_instant_features_follow_deltas():
+    """Мгновенные признаки серы доходят до модели и пересчитываются после изменения T5."""
+    from datetime import datetime
+
+    from src.agents.quality import QualityAgent
+    from src.contracts import ProcessState
+    from src.models.avt import AVTModel
+    from src.models.go import GOModel
+
+    tags = {"242000:T5": 370.0, "242000:T6": 362.0, "242000:Q20": 7900.0,
+            "242000:F25": 13000.0, "242000:F9": 210.0}
+    state = ProcessState(ts=datetime(2025, 6, 10, 12, 0), tags=tags, lims={}, pak={}, dq_flags=[])
+    qa = QualityAgent(avt_model=AVTModel(), go_model=GOModel())
+    seen = []
+    orig = qa.go.predict
+    qa.go.predict = lambda f: (seen.append(dict(f)), orig(f))[1]
+    qa._predict(state, {"242000:T5": 2.0})
+    now, new = seen[0], seen[1]
+    for n in ("242000:T5_T6_quench_delta", "242000:h2_oil_ratio",
+              "242000:arrhenius_t5", "242000:q20_x_arrhenius"):
+        assert n in now and n in new, n
+    assert new["242000:arrhenius_t5"] > now["242000:arrhenius_t5"]
+    assert new["242000:h2_oil_ratio"] == now["242000:h2_oil_ratio"]

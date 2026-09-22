@@ -72,7 +72,12 @@ from typing import Dict, Mapping, Optional
 from ..contracts import Interval
 from . import vak_formulas as vak
 from .base import BaseQualityModel, monotone_vector
-from .features import arrhenius_term
+from .features import (
+    GO_INSTANT_BASE,
+    GO_INSTANT_NAMES,
+    arrhenius_term,
+    go_instant_features,
+)
 from .formula_residual import FormulaPlusResidual
 _R_KJ_MOL_K = 8.314e-3
 _SULFUR_EA_KJ_MOL = 55.0
@@ -186,23 +191,22 @@ class GOModel(BaseQualityModel):
             v = f.get(key)
             return None if v is None or (isinstance(v, float) and math.isnan(v)) else float(v)
 
-        def put(key, value):
-            if val(key) is None and value is not None:
+        # Сами формулы живут в одном месте, models/features.go_instant_features:
+        # там же их берёт обучение (scripts/train_go.py). Вторая копия здесь
+        # означала бы, что правка формулы при обучении молча расходится с тем,
+        # что считает рабочий цикл, а это ровно тот training/serving skew,
+        # из-за которого признаки и пропадали.
+        supplied = {key for key in GO_INSTANT_NAMES if val(key) is not None}
+        for key, value in go_instant_features({t: val(t) for t in GO_INSTANT_BASE}).items():
+            if key not in supplied:
                 f[key] = value
 
-        t5, t6 = val("242000:T5"), val("242000:T6")
-        q20 = val("242000:Q20")
-        f25, f9 = val("242000:F25"), val("242000:F9")
-
-        if t5 is not None:
-            put("242000:arrhenius_t5", float(arrhenius_term(t5)))
-        if t5 is not None and t6 is not None:
-            put("242000:T5_T6_quench_delta", t5 - t6)
-        if f25 is not None and f9:
-            put("242000:h2_oil_ratio", f25 / f9)
-        arr = val("242000:arrhenius_t5")
-        if q20 is not None and arr is not None:
-            put("242000:q20_x_arrhenius", q20 * arr)
+        # Произведение берёт ТОТ член Аррениуса, который в итоге оказался в
+        # наборе: если вызывающий передал свой, смешивать его с нашим нельзя.
+        if "242000:q20_x_arrhenius" not in supplied:
+            q20, arrhenius = val("242000:Q20"), val("242000:arrhenius_t5")
+            if q20 is not None and arrhenius is not None:
+                f["242000:q20_x_arrhenius"] = q20 * arrhenius
         return f
 
     def predict_effect(self, features_now: Dict[str, float],

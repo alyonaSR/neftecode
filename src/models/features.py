@@ -144,3 +144,26 @@ def time_split(df: pd.DataFrame, cutoff: str = "2025-12-31"):
     """
     c = pd.Timestamp(cutoff)
     return df[df.index <= c], df[df.index > c]
+
+
+# мгновенные признаки серы: одна функция для обучения и для работы системы
+GO_INSTANT_BASE = ["242000:T5", "242000:T6", "242000:Q20", "242000:F25", "242000:F9"]
+GO_INSTANT_NAMES = ["242000:T5_T6_quench_delta", "242000:h2_oil_ratio",
+                    "242000:arrhenius_t5", "242000:q20_x_arrhenius"]
+
+
+def add_go_instant(df: pd.DataFrame) -> pd.DataFrame:
+    """Квенч-дельта, водород/сырьё, аррениусовский член и его произведение с серой сырья."""
+    out = df.copy()
+    out["242000:T5_T6_quench_delta"] = df["242000:T5"] - df["242000:T6"]
+    out["242000:h2_oil_ratio"] = df["242000:F25"] / df["242000:F9"].replace(0, float("nan"))
+    out["242000:arrhenius_t5"] = arrhenius_term(df["242000:T5"])
+    out["242000:q20_x_arrhenius"] = df["242000:Q20"] * out["242000:arrhenius_t5"]
+    return out
+
+
+def go_instant_features(raw: Dict[str, Optional[float]]) -> Dict[str, float]:
+    """То же для одной точки: словарь тегов в словарь признаков без пропусков."""
+    row = pd.DataFrame([{t: raw.get(t) for t in GO_INSTANT_BASE}], dtype=float)
+    last = add_go_instant(row).iloc[0]
+    return {n: float(last[n]) for n in GO_INSTANT_NAMES if pd.notna(last[n])}
