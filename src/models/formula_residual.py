@@ -48,6 +48,28 @@ def _safe_name(col: str) -> str:
     return col.replace(":", "__")
 
 
+def _fit_shrink(pred, y, const: float) -> float:
+    """
+    Вес доверия к прогнозу: итог = w*прогноз + (1-w)*константа.
+
+    Подбирается на калибровке, поэтому механизм самоограничивающийся --
+    у хорошей модели w уходит в 1.0 и ничего не меняется. Нужен там, где
+    признаки не переносятся во времени и остаток переобучается: замер
+    2026-09-22 (walk-forward, 5 блоков, skill против константы)
+
+        AVT.feed_cfpp_c   -18.9%  ->  +1.1%   (w=0.20)
+        GO.cfpp_c         -12.9%  ->  -1.4%   (w=0.09)
+
+    Малый вес -- не поражение, а честное признание: столько сигнала в
+    признаках и есть.
+    """
+    pred = np.asarray(pred, dtype=float)
+    y = np.asarray(y, dtype=float)
+    grid = np.linspace(0.0, 1.0, 21)
+    errs = [np.mean(((w * pred + (1.0 - w) * const) - y) ** 2) for w in grid]
+    return float(grid[int(np.argmin(errs))])
+
+
 def _as_float_or_nan(v):
     """
     Найдено Person 1 (прогон полного цикла, воспроизведено и подтверждено):
@@ -75,6 +97,8 @@ class FormulaPlusResidual:
         self._model = None
         self._conformal: Optional[ConformalResidualBounds] = None
         self._resid_bias = 0.0  # медиана остатка на калибровке, см. fit()
+        self._const = None      # тривиальная база для усадки, см. _fit_shrink
+        self._shrink = 1.0      # вес доверия к прогнозу (1.0 = усадки нет)
         self._sigma_model = None  # H-I1: предсказывает |остаток| -> условная ширина
         self._sigma_floor = 1.0   # пол для sigma, чтобы не делить на ~0
         self._n_train = 0
@@ -185,6 +209,15 @@ class FormulaPlusResidual:
             # ЛИМС -- не шум, устойчивый сдвиг на всех трёх demo-сценариях.
             # Медиана остатка -- честная оценка сдвига (устойчивее к
             # выбросам, чем среднее), добавляется к точечному прогнозу.
+            # H-P3 (SULFUR_HYPOTHESES.md, 2026-09-22): усадка к тривиальной
+            # базе. Вес подбирается на КАЛИБРОВКЕ, то есть модель сама
+            # признаёт, насколько ей стоит верить: если прогноз хорош, вес
+            # уходит в 1.0 и механизм ничего не меняет. Смещение считается
+            # ПОСЛЕ усадки, иначе поправка относилась бы к другому центру.
+            self._const = float(y_train.mean())
+            self._shrink = _fit_shrink(pred_calib.values, y_calib.values, self._const)
+            blended = self._shrink * pred_calib + (1.0 - self._shrink) * self._const
+            err = y_calib - blended
             self._resid_bias = float(np.median(err))
             err_debiased = err - self._resid_bias
 
@@ -257,7 +290,10 @@ class FormulaPlusResidual:
         safe_row = row[self.feature_cols].rename(columns=_safe_name)
         resid = float(self._model.predict(safe_row)[0])
         # + resid_bias: коррекция систематического сдвига калибровки, см. fit()
-        mean = base + resid + (self._resid_bias or 0.0)
+        point = base + resid
+        if self._const is not None and self._shrink < 1.0:
+            point = self._shrink * point + (1.0 - self._shrink) * self._const
+        mean = point + (self._resid_bias or 0.0)
         if self._conformal is not None:
             offset_lo, offset_hi = self._conformal.bounds()
         else:
@@ -302,6 +338,8 @@ class FormulaPlusResidual:
             "resid_bias": self._resid_bias,
             "sigma_model": self._sigma_model,   # H-I1, условная ширина интервала
             "sigma_floor": self._sigma_floor,
+            "const": self._const,               # H-P3, усадка к тривиальной базе
+            "shrink": self._shrink,
             "n_train": self._n_train, "n_calib": self._n_calib,
             "fallback_mean": self.fallback_mean,
         }
@@ -340,6 +378,10 @@ class FormulaPlusResidual:
         # глобальным, ровно как раньше. Обратная совместимость без ветвлений.
         obj._sigma_model = state.get("sigma_model")
         obj._sigma_floor = state.get("sigma_floor", 1.0)
+        # старый артефакт без этих полей: const=None, shrink=1.0 -- усадки
+        # нет, поведение ровно прежнее
+        obj._const = state.get("const")
+        obj._shrink = state.get("shrink", 1.0)
         obj._n_train = state.get("n_train", 0)
         obj._n_calib = state.get("n_calib", 0)
         obj.fallback_mean = state.get("fallback_mean", fallback_mean)
